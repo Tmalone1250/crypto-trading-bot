@@ -3,7 +3,7 @@ name: Deploy Quant Agent to Raspberry Pi
 on:
   push:
     branches:
-      - main
+      - master
 
 jobs:
   deploy:
