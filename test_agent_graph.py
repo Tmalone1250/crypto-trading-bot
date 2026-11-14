@@ -5,7 +5,13 @@ import pytest
 from langgraph.graph import END
 
 import agent_graph
-from agent_graph import app, build_agent_graph, route_after_alpha, route_after_risk
+from agent_graph import (
+    app,
+    build_agent_graph,
+    route_after_alpha,
+    route_after_observer,
+    route_after_risk,
+)
 from state import AgentState
 
 
@@ -22,6 +28,26 @@ def _make_state(**overrides) -> AgentState:
     }
     base.update(overrides)
     return base
+
+
+@pytest.mark.parametrize(
+    ("has_data", "error_message", "expected"),
+    [
+        (True, None, "alpha"),
+        (True, "Market observer error", END),
+        (False, None, END),
+        (False, "No market data returned", END),
+    ],
+)
+def test_route_after_observer(
+    has_data: bool,
+    error_message: str | None,
+    expected: str,
+) -> None:
+    """Verify ``route_after_observer`` short-circuits to ``END`` on errors or empty data."""
+    df = pd.DataFrame({"close": [90000.0]}) if has_data else pd.DataFrame()
+    state = _make_state(historical_data=df, error_message=error_message)
+    assert route_after_observer(state) == expected
 
 
 @pytest.mark.parametrize(

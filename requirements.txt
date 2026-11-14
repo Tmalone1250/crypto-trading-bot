@@ -4,5 +4,6 @@ duckdb
 pandas
 numpy
 python-dotenv
+mcp
 pytest
 # Note: TA-Lib requires a system-level C-library installation first.

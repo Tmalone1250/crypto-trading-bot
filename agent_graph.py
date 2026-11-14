@@ -1,7 +1,7 @@
 """LangGraph Traffic Cop: compiles the 4-node autonomous trading state machine.
 
 Wires ``observer`` -> ``alpha`` -> ``risk`` -> ``executor`` with deterministic
-conditional routing gates between Alpha/Risk and Risk/Executor.
+conditional routing gates after Observer, Alpha, and Risk nodes.
 """
 
 import os
@@ -17,6 +17,22 @@ from state import AgentState
 
 SENTIMENT_THRESHOLD: float = 0.5
 SCAN_INTERVAL_SECONDS: int = 60
+
+
+def route_after_observer(state: AgentState) -> str:
+    """Route to ``alpha`` only when Node 1 populated ``historical_data`` without errors.
+
+    Args:
+        state: Current ``AgentState`` dictionary after Node 1 execution.
+
+    Returns:
+        ``END`` if ``error_message`` is set or ``historical_data`` is empty,
+        otherwise ``"alpha"``.
+    """
+    df = state["historical_data"]
+    if state["error_message"] is not None or df is None or df.empty:
+        return END
+    return "alpha"
 
 
 def route_after_alpha(state: AgentState) -> str:
@@ -57,9 +73,16 @@ def build_agent_graph():
     graph.add_node("risk", risk_manager_node)
     graph.add_node("executor", execution_node)
 
-    # Wire entry point and sequential/conditional transitions.
+    # Wire entry point and conditional transitions.
     graph.set_entry_point("observer")
-    graph.add_edge("observer", "alpha")
+    graph.add_conditional_edges(
+        "observer",
+        route_after_observer,
+        {
+            "alpha": "alpha",
+            END: END,
+        },
+    )
     graph.add_conditional_edges(
         "alpha",
         route_after_alpha,

@@ -1,11 +1,19 @@
 """Unit tests for Node 1 (Market Observer) with Alpaca MCP & strategy filter."""
 
-from unittest.mock import patch
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pandas as pd
 import pytest
 
-from observer_node import BAR_LIMIT, BAR_TIMEFRAME, market_observer_node
+from observer_node import (
+    BAR_LIMIT,
+    BAR_TIMEFRAME,
+    _format_bars_dataframe,
+    get_crypto_bars,
+    market_observer_node,
+)
 from state import AgentState
 
 
@@ -116,3 +124,47 @@ def test_market_observer_node_api_timeout_sets_error_message(base_state: AgentSt
     assert "timed out" in updated_state["error_message"]
     assert updated_state["current_price"] == 0.0
     assert updated_state["historical_data"].empty
+
+
+def test_format_bars_dataframe_parses_json_and_symbol_variants() -> None:
+    """Verify JSON string MCP payloads and ``BTCUSD`` vs ``BTC/USD`` keys parse cleanly."""
+    payload = json.dumps({"bars": {"BTCUSD": _sample_mcp_bars(2)}})
+    df = _format_bars_dataframe(payload, "BTC/USD")
+    assert len(df) == 2
+    assert df["close"].dtype == np.float64
+    assert float(df["close"].iloc[-1]) == pytest.approx(90750.25)
+
+
+def test_get_crypto_bars_calls_mcp_stdio_session() -> None:
+    """Verify ``get_crypto_bars`` invokes ``alpaca-mcp-server`` via mocked MCP stdio."""
+    bars = _sample_mcp_bars(2)
+    mock_tool_result = SimpleNamespace(
+        isError=False,
+        structuredContent=None,
+        content=[SimpleNamespace(text=json.dumps({"bars": {"BTC/USD": bars}}))],
+    )
+
+    mock_session = MagicMock()
+    mock_session.initialize = AsyncMock()
+    mock_session.call_tool = AsyncMock(return_value=mock_tool_result)
+
+    mock_session_cm = MagicMock()
+    mock_session_cm.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_cm.__aexit__ = AsyncMock(return_value=None)
+
+    mock_stdio_cm = MagicMock()
+    mock_stdio_cm.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock()))
+    mock_stdio_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch("observer_node.stdio_client", return_value=mock_stdio_cm),
+        patch("observer_node.ClientSession", return_value=mock_session_cm),
+    ):
+        result = get_crypto_bars("BTC/USD", timeframe="1Hour", limit=250)
+
+    mock_session.initialize.assert_awaited_once()
+    mock_session.call_tool.assert_awaited_once_with(
+        "get_crypto_bars",
+        arguments={"symbol": "BTC/USD", "timeframe": "1Hour", "limit": 250},
+    )
+    assert json.loads(result)["bars"]["BTC/USD"] == bars
