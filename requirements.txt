@@ -1,0 +1,8 @@
+langgraph
+langchain-google-genai
+duckdb
+pandas
+numpy
+python-dotenv
+pytest
+# Note: TA-Lib requires a system-level C-library installation first.

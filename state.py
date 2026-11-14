@@ -1,0 +1,26 @@
+"""Global LangGraph state schema for the autonomous crypto swing-trading agent."""
+
+from typing import Any, Optional, TypedDict
+import pandas as pd
+
+
+class AgentState(TypedDict):
+    """Shared state dictionary passed sequentially across all LangGraph nodes.
+
+    Attributes:
+        asset_symbol: Target trading pair symbol (e.g., ``"BTC/USD"``).
+        current_price: Latest observed asset price in quote currency.
+        historical_data: OHLCV candlestick DataFrame used for pattern and ATR math.
+        sentiment_score: Polarity score from Node 2 (Gemini Alpha) in ``[-1.0, 1.0]``.
+        risk_cleared: Gate flag set by Node 3 (TA-Lib Risk Manager).
+        order_details: Execution payload and metadata populated by Node 4.
+        error_message: Optional error string captured when a node fails gracefully.
+    """
+
+    asset_symbol: str
+    current_price: float
+    historical_data: pd.DataFrame
+    sentiment_score: float
+    risk_cleared: bool
+    order_details: dict[str, Any]
+    error_message: Optional[str]
