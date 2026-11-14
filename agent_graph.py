@@ -4,6 +4,9 @@ Wires ``observer`` -> ``alpha`` -> ``risk`` -> ``executor`` with deterministic
 conditional routing gates between Alpha/Risk and Risk/Executor.
 """
 
+import os
+import time
+import pandas as pd
 from langgraph.graph import END, StateGraph
 
 from alpha_node import alpha_logic_gate_node
@@ -13,6 +16,7 @@ from risk_node import risk_manager_node
 from state import AgentState
 
 SENTIMENT_THRESHOLD: float = 0.5
+SCAN_INTERVAL_SECONDS: int = 60
 
 
 def route_after_alpha(state: AgentState) -> str:
@@ -78,3 +82,32 @@ def build_agent_graph():
 
 
 app = build_agent_graph()
+
+
+if __name__ == "__main__":
+    print("🚀 Quant Agent Online. Beginning market scanning loop...")
+    target_symbol = os.environ.get("ASSET_SYMBOL", "BTC/USD")
+
+    while True:
+        initial_state: AgentState = {
+            "asset_symbol": target_symbol,
+            "current_price": 0.0,
+            "historical_data": pd.DataFrame(),
+            "sentiment_score": 0.0,
+            "risk_cleared": False,
+            "order_details": {},
+            "error_message": None,
+        }
+
+        try:
+            result = app.invoke(initial_state)
+            if result.get("error_message"):
+                print(f"[Scan] {result['error_message']}")
+        except KeyboardInterrupt:
+            print("Shutting down Quant Agent scanning loop.")
+            break
+        except Exception as exc:
+            print(f"[Error] Graph execution failed: {exc}")
+
+        # Scan once per minute to respect API and LLM rate limits.
+        time.sleep(SCAN_INTERVAL_SECONDS)
