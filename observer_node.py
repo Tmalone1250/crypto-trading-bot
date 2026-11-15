@@ -96,7 +96,9 @@ async def _fetch_crypto_bars_mcp(
         env=env,
     )
 
-    start_iso = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).isoformat()
+    start_date = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime(
+        "%Y-%m-%d"
+    )
 
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
@@ -107,9 +109,10 @@ async def _fetch_crypto_bars_mcp(
                     "symbols": symbol,
                     "timeframe": timeframe,
                     "limit": limit,
-                    "start": start_iso,
+                    "start": start_date,
                 },
             )
+            print(f"DEBUG - Raw MCP Output: {result}")
             return _extract_mcp_result(result)
 
 

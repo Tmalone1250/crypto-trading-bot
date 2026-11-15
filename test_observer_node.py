@@ -171,7 +171,7 @@ def test_get_crypto_bars_calls_mcp_stdio_session_with_12_day_start() -> None:
     mock_stdio_cm.__aexit__ = AsyncMock(return_value=None)
 
     fixed_now = datetime(2026, 11, 14, 18, 0, 0, tzinfo=timezone.utc)
-    expected_start = (fixed_now - timedelta(days=LOOKBACK_DAYS)).isoformat()
+    expected_start = (fixed_now - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
 
     with (
         patch("observer_node.stdio_client", return_value=mock_stdio_cm),
