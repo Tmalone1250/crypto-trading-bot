@@ -37,15 +37,16 @@ def route_after_observer(state: AgentState) -> str:
 
 
 def route_after_alpha(state: AgentState) -> str:
-    """Route to ``risk`` only when sentiment exceeds the bullish threshold.
+    """Route to ``risk`` for ``BUY``/``SELL`` decisions, or ``END`` when ``HOLD``.
 
     Args:
         state: Current ``AgentState`` dictionary after Node 2 execution.
 
     Returns:
-        ``"risk"`` if ``sentiment_score > 0.5``, otherwise ``END``.
+        ``"risk"`` if ``decision`` is ``"BUY"`` or ``"SELL"``, otherwise ``END``.
     """
-    if state["sentiment_score"] > SENTIMENT_THRESHOLD:
+    decision = str(state.get("decision", "HOLD")).upper()
+    if decision in {"BUY", "SELL"}:
         return "risk"
     return END
 
@@ -126,6 +127,7 @@ if __name__ == "__main__":
             "account_data": {},
             "open_positions": [],
             "active_orders": [],
+            "decision": "HOLD",
         }
 
         try:

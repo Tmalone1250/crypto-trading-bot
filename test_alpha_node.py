@@ -1,4 +1,4 @@
-"""Unit tests for Node 2 (Alpha Logic Gate) following TDD and .ai_rules standards."""
+"""Unit tests for Node 2 (Alpha Logic Gate / Autonomous Quant Manager)."""
 
 from unittest.mock import MagicMock, patch
 import pandas as pd
@@ -19,6 +19,7 @@ REQUIRED_STATE_KEYS = {
     "account_data",
     "open_positions",
     "active_orders",
+    "decision",
 }
 
 
@@ -35,11 +36,12 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["account_data"], dict)
     assert isinstance(state["open_positions"], list)
     assert isinstance(state["active_orders"], list)
+    assert isinstance(state["decision"], str)
 
 
 @pytest.fixture
 def populated_state() -> AgentState:
-    """Return a valid ``AgentState`` populated with sample OHLCV data."""
+    """Return a valid ``AgentState`` populated with portfolio state and sample OHLCV data."""
     df = pd.DataFrame(
         {
             "open": [90000.0, 90500.0, 91000.0],
@@ -57,18 +59,37 @@ def populated_state() -> AgentState:
         "risk_cleared": False,
         "order_details": {},
         "error_message": None,
-        "account_data": {},
-        "open_positions": [],
+        "account_data": {
+            "buying_power": "399916.80",
+            "cash": "99979.20",
+            "portfolio_value": "99999.89",
+        },
+        "open_positions": [
+            {
+                "symbol": "BTCUSD",
+                "side": "long",
+                "qty": "0.000332",
+                "avg_entry_price": "90100.0",
+                "market_value": "30.43",
+                "unrealized_pl": "0.51",
+            }
+        ],
         "active_orders": [],
+        "decision": "HOLD",
     }
 
 
-def test_alpha_logic_gate_node_success(populated_state: AgentState) -> None:
-    """Verify a valid structured JSON response updates ``sentiment_score``."""
+def test_alpha_logic_gate_node_injects_portfolio_state_and_returns_decision(
+    populated_state: AgentState,
+) -> None:
+    """Verify prompt injects buying power, holdings, and condensed bars, updating decision & score."""
     _assert_valid_agent_state(populated_state)
 
     mock_structured_llm = MagicMock()
-    mock_structured_llm.invoke.return_value = SentimentResponse(sentiment_score=0.78)
+    mock_structured_llm.invoke.return_value = SentimentResponse(
+        decision="BUY",
+        sentiment_score=0.78,
+    )
 
     mock_llm_instance = MagicMock()
     mock_llm_instance.with_structured_output.return_value = mock_structured_llm
@@ -81,15 +102,30 @@ def test_alpha_logic_gate_node_success(populated_state: AgentState) -> None:
     mock_llm_instance.with_structured_output.assert_called_once_with(SentimentResponse)
     mock_structured_llm.invoke.assert_called_once()
 
+    messages = mock_structured_llm.invoke.call_args.args[0]
+    assert len(messages) == 2
+    system_content = messages[0].content
+    human_content = messages[1].content
+
+    assert "399916.80" in system_content
+    assert "BTCUSD" in system_content
+    assert "0.000332" in system_content
+    assert "Window Summary (3 bars)" in human_content
+    assert "BTC/USD" in human_content
+
     _assert_valid_agent_state(updated_state)
+    assert updated_state["decision"] == "BUY"
     assert updated_state["sentiment_score"] == pytest.approx(0.78)
     assert updated_state["error_message"] is None
 
 
-def test_alpha_logic_gate_node_api_failure_defaults_score(populated_state: AgentState) -> None:
-    """Verify API failure/rate limit defaults ``sentiment_score`` to 0.0 and sets ``error_message``."""
+def test_alpha_logic_gate_node_api_failure_defaults_hold_and_zero_score(
+    populated_state: AgentState,
+) -> None:
+    """Verify API failure/rate limit defaults ``decision`` to ``HOLD`` and ``sentiment_score`` to ``0.0``."""
     _assert_valid_agent_state(populated_state)
     populated_state["sentiment_score"] = 0.65
+    populated_state["decision"] = "BUY"
 
     mock_structured_llm = MagicMock()
     mock_structured_llm.invoke.side_effect = RuntimeError("429 Resource Exhausted: rate limit exceeded")
@@ -101,6 +137,7 @@ def test_alpha_logic_gate_node_api_failure_defaults_score(populated_state: Agent
         updated_state = alpha_logic_gate_node(populated_state)
 
     _assert_valid_agent_state(updated_state)
+    assert updated_state["decision"] == "HOLD"
     assert updated_state["sentiment_score"] == 0.0
     assert updated_state["error_message"] is not None
     assert "rate limit exceeded" in updated_state["error_message"]

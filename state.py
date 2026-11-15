@@ -18,6 +18,7 @@ class AgentState(TypedDict):
         account_data: Alpaca account balances, buying power, and status dictionary.
         open_positions: List of currently held open positions from Alpaca.
         active_orders: List of currently active/open orders from Alpaca.
+        decision: Autonomous quant manager decision from Node 2 (``"BUY"``, ``"SELL"``, or ``"HOLD"``).
     """
 
     asset_symbol: str
@@ -30,3 +31,4 @@ class AgentState(TypedDict):
     account_data: dict[str, Any]
     open_positions: list[dict[str, Any]]
     active_orders: list[dict[str, Any]]
+    decision: str

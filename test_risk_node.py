@@ -24,6 +24,7 @@ REQUIRED_STATE_KEYS = {
     "account_data",
     "open_positions",
     "active_orders",
+    "decision",
 }
 
 
@@ -40,6 +41,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["account_data"], dict)
     assert isinstance(state["open_positions"], list)
     assert isinstance(state["active_orders"], list)
+    assert isinstance(state["decision"], str)
 
 
 def _build_synthetic_ohlcv(
@@ -79,6 +81,7 @@ def test_risk_manager_node_cleared_low_volatility_and_btc_sizing() -> None:
         "account_data": {},
         "open_positions": [],
         "active_orders": [],
+        "decision": "BUY",
     }
     _assert_valid_agent_state(state)
 
@@ -115,6 +118,7 @@ def test_risk_manager_node_vetoed_high_volatility() -> None:
         "account_data": {},
         "open_positions": [],
         "active_orders": [],
+        "decision": "BUY",
     }
     _assert_valid_agent_state(state)
 

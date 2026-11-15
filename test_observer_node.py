@@ -1,4 +1,4 @@
-"""Unit tests for Node 1 (Market Observer) with Alpaca MCP & strategy filter."""
+"""Unit tests for Node 1 (Market Observer) with Alpaca MCP data ingestion."""
 
 from datetime import datetime, timedelta, timezone
 import json
@@ -30,6 +30,7 @@ REQUIRED_STATE_KEYS = {
     "account_data",
     "open_positions",
     "active_orders",
+    "decision",
 }
 
 
@@ -46,6 +47,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["account_data"], dict)
     assert isinstance(state["open_positions"], list)
     assert isinstance(state["active_orders"], list)
+    assert isinstance(state["decision"], str)
 
 
 def _sample_mcp_bars(count: int = 3) -> list[dict]:
@@ -77,22 +79,19 @@ def base_state() -> AgentState:
         "account_data": {},
         "open_positions": [],
         "active_orders": [],
+        "decision": "HOLD",
     }
 
 
-def test_market_observer_node_success_when_signal_triggers(base_state: AgentState) -> None:
-    """Verify live MCP bars are formatted to float64 and state updates when filter returns True."""
+def test_market_observer_node_success(base_state: AgentState) -> None:
+    """Verify live MCP bars are formatted to float64 and state updates without static filtering."""
     _assert_valid_agent_state(base_state)
     bars = _sample_mcp_bars(3)
 
-    with (
-        patch("observer_node.get_crypto_bars", return_value=bars) as mock_mcp,
-        patch("observer_node.check_entry_signal", return_value=True) as mock_filter,
-    ):
+    with patch("observer_node.get_crypto_bars", return_value=bars) as mock_mcp:
         updated_state = market_observer_node(base_state)
 
     mock_mcp.assert_called_once_with(symbol="BTC/USD", timeframe=BAR_TIMEFRAME, limit=BAR_LIMIT)
-    mock_filter.assert_called_once()
     _assert_valid_agent_state(updated_state)
 
     df = updated_state["historical_data"]
@@ -101,22 +100,6 @@ def test_market_observer_node_success_when_signal_triggers(base_state: AgentStat
 
     assert updated_state["current_price"] == pytest.approx(bars[-1]["close"])
     assert updated_state["error_message"] is None
-
-
-def test_market_observer_node_raises_value_error_when_no_setup(base_state: AgentState) -> None:
-    """Verify ``ValueError`` is raised to short-circuit the graph when filter returns False."""
-    _assert_valid_agent_state(base_state)
-    bars = _sample_mcp_bars(3)
-
-    with (
-        patch("observer_node.get_crypto_bars", return_value=bars) as mock_mcp,
-        patch("observer_node.check_entry_signal", return_value=False) as mock_filter,
-    ):
-        with pytest.raises(ValueError, match="No structural setup detected"):
-            market_observer_node(base_state)
-
-    mock_mcp.assert_called_once_with(symbol="BTC/USD", timeframe=BAR_TIMEFRAME, limit=BAR_LIMIT)
-    mock_filter.assert_called_once()
 
 
 def test_market_observer_node_api_timeout_sets_error_message(base_state: AgentState) -> None:

@@ -34,6 +34,7 @@ REQUIRED_STATE_KEYS = {
     "account_data",
     "open_positions",
     "active_orders",
+    "decision",
 }
 
 
@@ -50,6 +51,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["account_data"], dict)
     assert isinstance(state["open_positions"], list)
     assert isinstance(state["active_orders"], list)
+    assert isinstance(state["decision"], str)
 
 
 def _sample_security_envelope(tool_name: str, data_payload: dict | list) -> str:
@@ -84,6 +86,7 @@ def base_state() -> AgentState:
         "account_data": {},
         "open_positions": [],
         "active_orders": [],
+        "decision": "HOLD",
     }
 
 

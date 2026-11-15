@@ -28,6 +28,7 @@ def _make_state(**overrides) -> AgentState:
         "account_data": {},
         "open_positions": [],
         "active_orders": [],
+        "decision": "HOLD",
     }
     base.update(overrides)
     return base
@@ -54,18 +55,18 @@ def test_route_after_observer(
 
 
 @pytest.mark.parametrize(
-    ("sentiment_score", "expected"),
+    ("decision", "sentiment_score", "expected"),
     [
-        (0.51, "risk"),
-        (0.95, "risk"),
-        (0.5, END),
-        (0.0, END),
-        (-0.8, END),
+        ("BUY", 0.78, "risk"),
+        ("SELL", -0.65, "risk"),
+        ("HOLD", 0.95, END),
+        ("HOLD", 0.0, END),
+        ("HOLD", -0.8, END),
     ],
 )
-def test_route_after_alpha(sentiment_score: float, expected: str) -> None:
-    """Verify ``route_after_alpha`` routes to ``risk`` iff ``sentiment_score > 0.5``."""
-    state = _make_state(sentiment_score=sentiment_score)
+def test_route_after_alpha(decision: str, sentiment_score: float, expected: str) -> None:
+    """Verify ``route_after_alpha`` routes to ``risk`` for ``BUY``/``SELL`` and ``END`` for ``HOLD``."""
+    state = _make_state(decision=decision, sentiment_score=sentiment_score)
     assert route_after_alpha(state) == expected
 
 

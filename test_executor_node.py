@@ -22,6 +22,7 @@ REQUIRED_STATE_KEYS = {
     "account_data",
     "open_positions",
     "active_orders",
+    "decision",
 }
 
 
@@ -38,6 +39,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["account_data"], dict)
     assert isinstance(state["open_positions"], list)
     assert isinstance(state["active_orders"], list)
+    assert isinstance(state["decision"], str)
 
 
 class _PersistentInMemoryConn:
@@ -77,6 +79,7 @@ def _build_ready_state(risk_cleared: bool) -> AgentState:
         "account_data": {},
         "open_positions": [],
         "active_orders": [],
+        "decision": "BUY",
     }
 
 

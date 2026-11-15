@@ -2,9 +2,8 @@
 
 Connects to ``alpaca-mcp-server`` over MCP stdio transport to invoke
 ``get_crypto_bars`` for the latest 250 hourly OHLCV candles (with a 12-day UTC
-``start`` lookback), normalizes numeric types to ``float64``, and gates execution
-through ``strategy_filter.check_entry_signal`` to preserve Node 2's 15 RPM
-Gemini free-tier rate limit.
+``start`` lookback) and normalizes numeric types to ``float64`` for downstream
+dynamic LLM reasoning.
 """
 
 import asyncio
@@ -22,7 +21,6 @@ import numpy as np
 import pandas as pd
 
 from state import AgentState
-from strategy_filter import check_entry_signal
 
 load_dotenv()
 
@@ -275,13 +273,7 @@ def _format_bars_dataframe(raw_bars: Any, symbol: str) -> pd.DataFrame:
 
 
 def market_observer_node(state: AgentState) -> AgentState:
-    """Fetch live hourly bars via Alpaca MCP and gate on the Iteration 2 strategy filter.
-
-    Raises:
-        ValueError: When ``check_entry_signal(df)`` returns ``False``, short-circuiting
-            the LangGraph execution back to the caller's ``try/except`` loop without
-            invoking Node 2 (Gemini Alpha).
-    """
+    """Fetch live hourly bars via Alpaca MCP and populate ``historical_data`` and ``current_price``."""
     symbol = state["asset_symbol"]
 
     try:
@@ -298,11 +290,6 @@ def market_observer_node(state: AgentState) -> AgentState:
             **state,
             "error_message": f"No market data returned for {symbol}.",
         }
-
-    if not check_entry_signal(df):
-        raise ValueError(
-            "No structural setup detected. Halting graph to preserve LLM rate limits."
-        )
 
     latest_price = float(df["close"].iloc[-1])
 
