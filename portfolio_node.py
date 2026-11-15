@@ -244,6 +244,11 @@ def portfolio_node(state: AgentState) -> AgentState:
             "error_message": f"Portfolio awareness error: {exc}",
         }
 
+    print(
+        f"[Portfolio] Value: ${account_data.get('portfolio_value', 'N/A')} "
+        f"| Open Positions: {len(open_positions)}"
+    )
+
     return {
         **state,
         "account_data": account_data,

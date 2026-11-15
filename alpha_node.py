@@ -156,11 +156,14 @@ def alpha_logic_gate_node(state: AgentState) -> AgentState:
                 HumanMessage(content=human_prompt),
             ]
         )
+        decision = str(result.decision).upper()
+        sentiment_score = float(result.sentiment_score)
+        print(f"[Alpha] Gemini Decision: {decision} | Sentiment Score: {sentiment_score}")
 
         return {
             **state,
-            "decision": str(result.decision).upper(),
-            "sentiment_score": float(result.sentiment_score),
+            "decision": decision,
+            "sentiment_score": sentiment_score,
             "error_message": None,
         }
     except Exception as exc:

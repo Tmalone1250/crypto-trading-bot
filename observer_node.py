@@ -110,7 +110,6 @@ async def _fetch_crypto_bars_mcp(
                     "start": start_date,
                 },
             )
-            print(f"DEBUG - Raw MCP Output: {result}")
             return _extract_mcp_result(result)
 
 
