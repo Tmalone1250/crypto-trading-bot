@@ -149,22 +149,33 @@ def _symbol_key_candidates(symbol: str) -> list[str]:
 
 
 def _extract_records_from_dict(payload: dict[str, Any], symbol: str) -> Any:
-    """Extract bar records from nested Alpaca MCP response dicts across key variants."""
-    container: Any = payload
-    for wrapper_key in ("bars", "data", "result"):
-        if wrapper_key in payload:
-            container = payload[wrapper_key]
-            break
+    """Extract bar records from FastMCP security-enveloped dicts across symbol variants.
 
-    if isinstance(container, list):
-        return container
+    Specifically handles the nested ``payload.get('data', {}).get('bars', {}).get(symbol, [])``
+    structure returned by ``alpaca-mcp-server`` as well as direct ``bars`` dicts and
+    slash-less symbol keys (e.g., ``BTCUSD`` vs ``BTC/USD``).
+    """
+    data_section: Any = payload.get("data", payload)
+    if isinstance(data_section, str):
+        try:
+            data_section = json.loads(data_section)
+        except json.JSONDecodeError:
+            pass
 
-    if isinstance(container, dict):
+    if isinstance(data_section, dict):
+        bars_container: Any = data_section.get("bars", data_section)
+    else:
+        bars_container = data_section
+
+    if isinstance(bars_container, list):
+        return bars_container
+
+    if isinstance(bars_container, dict):
         for candidate in _symbol_key_candidates(symbol):
-            if candidate in container:
-                return container[candidate]
-        if len(container) == 1:
-            only_val = next(iter(container.values()))
+            if candidate in bars_container and isinstance(bars_container[candidate], list):
+                return bars_container[candidate]
+        if len(bars_container) == 1:
+            only_val = next(iter(bars_container.values()))
             if isinstance(only_val, list):
                 return only_val
         return []

@@ -129,12 +129,32 @@ def test_market_observer_node_api_timeout_sets_error_message(base_state: AgentSt
 
 
 def test_format_bars_dataframe_parses_json_and_fastmcp_text() -> None:
-    """Verify JSON string payloads, ``BTCUSD`` keys, and FastMCP text outputs parse cleanly."""
-    payload = json.dumps({"bars": {"BTCUSD": _sample_mcp_bars(2)}})
-    df = _format_bars_dataframe(payload, "BTC/USD")
-    assert len(df) == 2
-    assert df["close"].dtype == np.float64
-    assert float(df["close"].iloc[-1]) == pytest.approx(90750.25)
+    """Verify nested FastMCP ``data.bars`` JSON payloads, ``BTCUSD`` keys, and text parse cleanly."""
+    enveloped_btc_slash = json.dumps(
+        {
+            "data": {
+                "bars": {"BTC/USD": _sample_mcp_bars(2)},
+                "next_page_token": None,
+            }
+        }
+    )
+    df_slash = _format_bars_dataframe(enveloped_btc_slash, "BTC/USD")
+    assert len(df_slash) == 2
+    assert df_slash["close"].dtype == np.float64
+    assert float(df_slash["close"].iloc[-1]) == pytest.approx(90750.25)
+
+    enveloped_btcusd = json.dumps(
+        {
+            "data": {
+                "bars": {"BTCUSD": _sample_mcp_bars(2)},
+                "next_page_token": None,
+            }
+        }
+    )
+    df_noslash = _format_bars_dataframe(enveloped_btcusd, "BTC/USD")
+    assert len(df_noslash) == 2
+    assert df_noslash["close"].dtype == np.float64
+    assert float(df_noslash["close"].iloc[-1]) == pytest.approx(90750.25)
 
     fastmcp_text = (
         "Historical Crypto Bars for BTC/USD:\n"
@@ -152,10 +172,11 @@ def test_format_bars_dataframe_parses_json_and_fastmcp_text() -> None:
 def test_get_crypto_bars_calls_mcp_stdio_session_with_12_day_start() -> None:
     """Verify ``get_crypto_bars`` passes ``symbols``, ``timeframe``, ``limit``, and 12-day ``start``."""
     bars = _sample_mcp_bars(2)
+    enveloped_payload = {"data": {"bars": {"BTC/USD": bars}, "next_page_token": None}}
     mock_tool_result = SimpleNamespace(
         isError=False,
         structuredContent=None,
-        content=[SimpleNamespace(text=json.dumps({"bars": {"BTC/USD": bars}}))],
+        content=[SimpleNamespace(text=json.dumps(enveloped_payload))],
     )
 
     mock_session = MagicMock()
@@ -191,4 +212,4 @@ def test_get_crypto_bars_calls_mcp_stdio_session_with_12_day_start() -> None:
             "start": expected_start,
         },
     )
-    assert json.loads(result)["bars"]["BTC/USD"] == bars
+    assert json.loads(result)["data"]["bars"]["BTC/USD"] == bars
