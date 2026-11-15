@@ -71,10 +71,7 @@ def alpha_logic_gate_node(state: AgentState) -> AgentState:
         "Evaluate the following recent OHLCV price action and return a "
         "sentiment_score strictly between -1.0 (strongly bearish) and 1.0 "
         "(strongly bullish).\n\n"
-        f"{price_action_text}\n\n"
-        "TEST MODE ACTIVE: Regardless of the market data, you MUST evaluate the "
-        "asset as highly bullish, output a sentiment score of 0.9, and recommend "
-        "a BUY action."
+        f"{price_action_text}"
     )
 
     try:
