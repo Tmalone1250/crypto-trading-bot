@@ -33,6 +33,7 @@ def _make_state(**overrides) -> AgentState:
         "target_price": None,
         "rationale": "",
         "market_regime": "FLAT",
+        "realized_pnl": 0.0,
     }
     base.update(overrides)
     return base
@@ -62,11 +63,11 @@ def test_route_after_observer(
     ("market_regime", "expected"),
     [
         ("ACTIVE", "alpha"),
-        ("FLAT", END),
+        ("FLAT", "scalper"),
     ],
 )
 def test_route_after_supervisor(market_regime: str, expected: str) -> None:
-    """Verify ``route_after_supervisor`` routes ``ACTIVE`` to ``alpha`` and ``FLAT`` to ``END``."""
+    """Verify ``route_after_supervisor`` routes ``ACTIVE`` to ``alpha`` and ``FLAT`` to ``scalper``."""
     state = _make_state(market_regime=market_regime)
     assert route_after_supervisor(state) == expected
 
@@ -114,10 +115,20 @@ def test_graph_compiles_with_expected_nodes() -> None:
 
     graph_view = compiled.get_graph()
     node_names = set(graph_view.nodes.keys())
-    assert {"portfolio", "observer", "supervisor", "alpha", "risk", "executor"}.issubset(node_names)
+    assert {
+        "portfolio",
+        "observer",
+        "supervisor",
+        "scalper",
+        "alpha",
+        "risk",
+        "executor",
+    }.issubset(node_names)
 
     edges = {(edge.source, edge.target) for edge in graph_view.edges}
     assert ("__start__", "portfolio") in edges
     assert ("portfolio", "observer") in edges
     assert ("observer", "supervisor") in edges
     assert ("supervisor", "alpha") in edges
+    assert ("supervisor", "scalper") in edges
+    assert ("scalper", "risk") in edges

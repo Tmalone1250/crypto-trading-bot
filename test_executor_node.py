@@ -31,6 +31,7 @@ REQUIRED_STATE_KEYS = {
     "target_price",
     "rationale",
     "market_regime",
+    "realized_pnl",
 }
 
 
@@ -51,6 +52,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert state["target_price"] is None or isinstance(state["target_price"], float)
     assert isinstance(state["rationale"], str)
     assert isinstance(state["market_regime"], str)
+    assert isinstance(state["realized_pnl"], float)
 
 
 class _PersistentInMemoryConn:
@@ -98,6 +100,7 @@ def _build_ready_state(
         "target_price": target_price,
         "rationale": "Test execution rationale",
         "market_regime": "ACTIVE",
+        "realized_pnl": 0.0,
     }
 
 
@@ -229,6 +232,25 @@ def test_execution_node_limit_sell_and_market_sell_pass_side_sell() -> None:
         _assert_valid_agent_state(updated_market_sell)
         assert updated_market_sell["order_details"]["action"] == "MARKET_SELL"
         assert updated_market_sell["order_details"]["trade_id"] == "mock-market-sell-002"
+
+        # Verify War Chest (realized_pnl) compounds when selling a profitable position.
+        war_chest_state = _build_ready_state(
+            risk_cleared=True,
+            action="LIMIT_SELL",
+            target_price=97000.0,
+        )
+        war_chest_state["realized_pnl"] = 1.50
+        war_chest_state["open_positions"] = [
+            {"symbol": "BTCUSD", "avg_entry_price": "95000.0", "qty": "0.000263"}
+        ]
+        with (
+            patch("executor_node.place_crypto_order", return_value="mock-war-chest-003"),
+            patch("executor_node.duckdb.connect", return_value=conn_proxy),
+        ):
+            updated_war_chest = execution_node(war_chest_state)
+
+        # (97000 - 95000) * 0.000263 = 0.526; 1.50 + 0.526 = 2.026
+        assert updated_war_chest["realized_pnl"] == pytest.approx(2.026)
     finally:
         in_mem_conn.close()
 

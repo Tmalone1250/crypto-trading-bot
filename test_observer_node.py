@@ -34,6 +34,7 @@ REQUIRED_STATE_KEYS = {
     "target_price",
     "rationale",
     "market_regime",
+    "realized_pnl",
 }
 
 
@@ -54,6 +55,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert state["target_price"] is None or isinstance(state["target_price"], float)
     assert isinstance(state["rationale"], str)
     assert isinstance(state["market_regime"], str)
+    assert isinstance(state["realized_pnl"], float)
 
 
 def _sample_mcp_bars(count: int = 3) -> list[dict]:
@@ -89,6 +91,7 @@ def base_state() -> AgentState:
         "target_price": None,
         "rationale": "",
         "market_regime": "FLAT",
+        "realized_pnl": 0.0,
     }
 
 

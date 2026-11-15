@@ -22,6 +22,7 @@ class AgentState(TypedDict):
         target_price: Optional limit price specified by the LLM for ``"LIMIT_BUY"`` or ``"LIMIT_SELL"``.
         rationale: Concise quantitative reasoning produced by the LLM for the selected action.
         market_regime: Deterministic volatility regime from the Supervisor node (``"FLAT"`` or ``"ACTIVE"``).
+        realized_pnl: Compounding realized profit/loss War Chest in USD (default ``0.0``).
     """
 
     asset_symbol: str
@@ -38,3 +39,4 @@ class AgentState(TypedDict):
     target_price: Optional[float]
     rationale: str
     market_regime: str
+    realized_pnl: float

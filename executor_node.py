@@ -233,6 +233,40 @@ def _log_trade_to_duckdb(
         conn.close()
 
 
+def _calculate_sell_profit(
+    state: AgentState,
+    order_details: dict[str, Any],
+    qty: float,
+) -> float:
+    """Estimate rough realized profit in USD for an executed sell order."""
+    target_symbol = state["asset_symbol"].replace("/", "").upper()
+    avg_entry = 0.0
+    for pos in state.get("open_positions") or []:
+        pos_sym = str(pos.get("symbol", "")).replace("/", "").upper()
+        if pos_sym == target_symbol:
+            try:
+                avg_entry = float(pos.get("avg_entry_price", 0.0))
+            except (TypeError, ValueError):
+                avg_entry = 0.0
+            break
+
+    if avg_entry <= 0.0:
+        try:
+            avg_entry = float(order_details.get("entry_price", 0.0))
+        except (TypeError, ValueError):
+            avg_entry = 0.0
+
+    raw_sell_price = order_details.get("limit_price", state.get("current_price", 0.0))
+    try:
+        sell_price = float(raw_sell_price)
+    except (TypeError, ValueError):
+        sell_price = float(state.get("current_price", 0.0))
+
+    if avg_entry <= 0.0 or sell_price <= 0.0 or qty <= 0.0:
+        return 0.0
+    return round((sell_price - avg_entry) * qty, 6)
+
+
 def execution_node(state: AgentState) -> AgentState:
     """Execute the LLM's lifecycle action (``MARKET_BUY``, ``LIMIT_BUY``, ``CANCEL_ALL``) via MCP.
 
@@ -322,9 +356,19 @@ def execution_node(state: AgentState) -> AgentState:
             "trade_id": trade_id,
         }
 
+        realized_pnl = float(state.get("realized_pnl", 0.0))
+        if action in {"LIMIT_SELL", "MARKET_SELL"}:
+            rough_profit = _calculate_sell_profit(
+                state=state,
+                order_details=order_details,
+                qty=float(order_details.get("position_size", raw_qty)),
+            )
+            realized_pnl = round(realized_pnl + rough_profit, 6)
+
         return {
             **state,
             "order_details": updated_order_details,
+            "realized_pnl": realized_pnl,
             "error_message": None,
         }
     except Exception as exc:

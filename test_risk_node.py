@@ -28,6 +28,7 @@ REQUIRED_STATE_KEYS = {
     "target_price",
     "rationale",
     "market_regime",
+    "realized_pnl",
 }
 
 
@@ -48,6 +49,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert state["target_price"] is None or isinstance(state["target_price"], float)
     assert isinstance(state["rationale"], str)
     assert isinstance(state["market_regime"], str)
+    assert isinstance(state["realized_pnl"], float)
 
 
 def _build_synthetic_ohlcv(
@@ -91,6 +93,7 @@ def test_risk_manager_node_cleared_low_volatility_and_btc_sizing() -> None:
         "target_price": 94800.0,
         "rationale": "Test limit buy",
         "market_regime": "ACTIVE",
+        "realized_pnl": 0.0,
     }
     _assert_valid_agent_state(state)
 
@@ -131,6 +134,7 @@ def test_risk_manager_node_vetoed_high_volatility() -> None:
         "target_price": None,
         "rationale": "Test high volatility veto",
         "market_regime": "ACTIVE",
+        "realized_pnl": 0.0,
     }
     _assert_valid_agent_state(state)
 

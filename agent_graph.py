@@ -14,6 +14,7 @@ from executor_node import execution_node
 from observer_node import market_observer_node
 from portfolio_node import portfolio_node
 from risk_node import risk_manager_node
+from scalper_expert_node import scalper_expert_node
 from state import AgentState
 from supervisor_node import supervisor_node
 
@@ -41,18 +42,18 @@ def route_after_observer(state: AgentState) -> str:
 
 
 def route_after_supervisor(state: AgentState) -> str:
-    """Route to ``alpha`` when ``market_regime == 'ACTIVE'``, otherwise short-circuit to ``END``.
+    """Route ``ACTIVE`` regimes to ``alpha`` and ``FLAT`` regimes to ``scalper``.
 
     Args:
         state: Current ``AgentState`` dictionary after Supervisor execution.
 
     Returns:
-        ``"alpha"`` if ``market_regime == "ACTIVE"``, otherwise ``END``.
+        ``"alpha"`` if ``market_regime == "ACTIVE"``, otherwise ``"scalper"``.
     """
     regime = str(state.get("market_regime", "FLAT")).upper()
     if regime == "ACTIVE":
         return "alpha"
-    return END
+    return "scalper"
 
 
 def route_after_alpha(state: AgentState) -> str:
@@ -90,10 +91,11 @@ def build_agent_graph():
     """Construct and compile the deterministic LangGraph trading workflow."""
     graph = StateGraph(AgentState)
 
-    # Register all six deterministic swarm execution nodes.
+    # Register all seven deterministic swarm execution nodes.
     graph.add_node("portfolio", portfolio_node)
     graph.add_node("observer", market_observer_node)
     graph.add_node("supervisor", supervisor_node)
+    graph.add_node("scalper", scalper_expert_node)
     graph.add_node("alpha", alpha_logic_gate_node)
     graph.add_node("risk", risk_manager_node)
     graph.add_node("executor", execution_node)
@@ -114,6 +116,14 @@ def build_agent_graph():
         route_after_supervisor,
         {
             "alpha": "alpha",
+            "scalper": "scalper",
+        },
+    )
+    graph.add_conditional_edges(
+        "scalper",
+        route_after_alpha,
+        {
+            "risk": "risk",
             END: END,
         },
     )
@@ -161,6 +171,7 @@ if __name__ == "__main__":
             "target_price": None,
             "rationale": "",
             "market_regime": "FLAT",
+            "realized_pnl": 0.0,
         }
 
         try:
