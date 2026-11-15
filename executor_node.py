@@ -40,20 +40,28 @@ def _is_dry_run() -> bool:
 
 def _extract_order_id(result: Any) -> str:
     """Extract an order/trade ID from an MCP ``place_crypto_order`` ``CallToolResult``."""
-    if getattr(result, "isError", False):
+    is_error = bool(
+        getattr(result, "is_error", False) or getattr(result, "isError", False)
+    )
+    content = getattr(result, "content", None) or []
+
+    if is_error:
         error_parts = [
-            getattr(item, "text", str(item))
-            for item in (getattr(result, "content", None) or [])
+            str(getattr(item, "text", item))
+            for item in content
         ]
         raise RuntimeError(" ".join(error_parts) or "Alpaca MCP order placement failed.")
 
-    structured = getattr(result, "structuredContent", None)
+    structured = getattr(result, "structured_content", None)
+    if structured is None:
+        structured = getattr(result, "structuredContent", None)
     if isinstance(structured, dict) and structured.get("id"):
         return str(structured["id"])
 
-    content = getattr(result, "content", None) or []
     text = "\n".join(
-        item.text for item in content if getattr(item, "text", None) is not None
+        text_val
+        for item in content
+        if isinstance((text_val := getattr(item, "text", None)), str)
     ).strip()
 
     if text:

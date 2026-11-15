@@ -45,20 +45,28 @@ _TEXT_BAR_REGEX = re.compile(
 
 def _extract_mcp_result(result: Any) -> Any:
     """Extract structured or JSON/text payload from an MCP ``CallToolResult``."""
-    if getattr(result, "isError", False):
+    is_error = bool(
+        getattr(result, "is_error", False) or getattr(result, "isError", False)
+    )
+    content = getattr(result, "content", None) or []
+
+    if is_error:
         error_parts = [
-            getattr(item, "text", str(item))
-            for item in (getattr(result, "content", None) or [])
+            str(getattr(item, "text", item))
+            for item in content
         ]
         raise RuntimeError(" ".join(error_parts) or "Alpaca MCP tool returned an error.")
 
-    structured = getattr(result, "structuredContent", None)
+    structured = getattr(result, "structured_content", None)
+    if structured is None:
+        structured = getattr(result, "structuredContent", None)
     if structured is not None:
         return structured
 
-    content = getattr(result, "content", None) or []
     text_chunks = [
-        item.text for item in content if getattr(item, "text", None) is not None
+        text_val
+        for item in content
+        if isinstance((text_val := getattr(item, "text", None)), str)
     ]
     if len(text_chunks) == 1:
         return text_chunks[0]
