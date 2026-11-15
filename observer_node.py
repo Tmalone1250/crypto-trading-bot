@@ -79,7 +79,7 @@ async def _fetch_crypto_bars_mcp(
             result = await session.call_tool(
                 "get_crypto_bars",
                 arguments={
-                    "symbol": symbol,
+                    "symbols": [symbol],
                     "timeframe": timeframe,
                     "limit": limit,
                 },

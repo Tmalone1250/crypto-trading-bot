@@ -165,6 +165,6 @@ def test_get_crypto_bars_calls_mcp_stdio_session() -> None:
     mock_session.initialize.assert_awaited_once()
     mock_session.call_tool.assert_awaited_once_with(
         "get_crypto_bars",
-        arguments={"symbol": "BTC/USD", "timeframe": "1Hour", "limit": 250},
+        arguments={"symbols": ["BTC/USD"], "timeframe": "1Hour", "limit": 250},
     )
     assert json.loads(result)["bars"]["BTC/USD"] == bars
