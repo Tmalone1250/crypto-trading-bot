@@ -3,14 +3,16 @@ name: Deploy Quant Agent to Raspberry Pi
 on:
   push:
     branches:
-      - master
+      - main
 
 jobs:
   deploy:
     runs-on: self-hosted
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Restart quant_agent service
-        run: sudo systemctl restart quant_agent
+      - name: Pull latest changes, install dependencies, and restart service
+        run: |
+          cd /home/tmalone1250/crypto-trading-bot
+          git pull
+          source venv/bin/activate
+          pip install -r requirements.txt
+          sudo systemctl restart quant_agent
