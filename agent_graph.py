@@ -1,7 +1,7 @@
-"""LangGraph Traffic Cop: compiles the 4-node autonomous trading state machine.
+"""LangGraph Traffic Cop: compiles the 5-node autonomous trading state machine.
 
-Wires ``observer`` -> ``alpha`` -> ``risk`` -> ``executor`` with deterministic
-conditional routing gates after Observer, Alpha, and Risk nodes.
+Wires ``portfolio`` -> ``observer`` -> ``alpha`` -> ``risk`` -> ``executor`` with
+deterministic conditional routing gates after Observer, Alpha, and Risk nodes.
 """
 
 import os
@@ -12,6 +12,7 @@ from langgraph.graph import END, StateGraph
 from alpha_node import alpha_logic_gate_node
 from executor_node import execution_node
 from observer_node import market_observer_node
+from portfolio_node import portfolio_node
 from risk_node import risk_manager_node
 from state import AgentState
 
@@ -67,14 +68,16 @@ def build_agent_graph():
     """Construct and compile the deterministic LangGraph trading workflow."""
     graph = StateGraph(AgentState)
 
-    # Register all four deterministic execution nodes.
+    # Register all five deterministic execution nodes.
+    graph.add_node("portfolio", portfolio_node)
     graph.add_node("observer", market_observer_node)
     graph.add_node("alpha", alpha_logic_gate_node)
     graph.add_node("risk", risk_manager_node)
     graph.add_node("executor", execution_node)
 
-    # Wire entry point and conditional transitions.
-    graph.set_entry_point("observer")
+    # Wire entry point (START -> portfolio -> observer) and conditional transitions.
+    graph.set_entry_point("portfolio")
+    graph.add_edge("portfolio", "observer")
     graph.add_conditional_edges(
         "observer",
         route_after_observer,
@@ -120,6 +123,9 @@ if __name__ == "__main__":
             "risk_cleared": False,
             "order_details": {},
             "error_message": None,
+            "account_data": {},
+            "open_positions": [],
+            "active_orders": [],
         }
 
         try:

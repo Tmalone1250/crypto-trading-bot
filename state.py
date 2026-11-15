@@ -15,6 +15,9 @@ class AgentState(TypedDict):
         risk_cleared: Gate flag set by Node 3 (TA-Lib Risk Manager).
         order_details: Execution payload and metadata populated by Node 4.
         error_message: Optional error string captured when a node fails gracefully.
+        account_data: Alpaca account balances, buying power, and status dictionary.
+        open_positions: List of currently held open positions from Alpaca.
+        active_orders: List of currently active/open orders from Alpaca.
     """
 
     asset_symbol: str
@@ -24,3 +27,6 @@ class AgentState(TypedDict):
     risk_cleared: bool
     order_details: dict[str, Any]
     error_message: Optional[str]
+    account_data: dict[str, Any]
+    open_positions: list[dict[str, Any]]
+    active_orders: list[dict[str, Any]]

@@ -25,6 +25,9 @@ def _make_state(**overrides) -> AgentState:
         "risk_cleared": False,
         "order_details": {},
         "error_message": None,
+        "account_data": {},
+        "open_positions": [],
+        "active_orders": [],
     }
     base.update(overrides)
     return base
@@ -80,11 +83,16 @@ def test_route_after_risk(risk_cleared: bool, expected: str) -> None:
 
 
 def test_graph_compiles_with_expected_nodes() -> None:
-    """Verify the LangGraph workflow compiles cleanly and contains all four nodes."""
+    """Verify the LangGraph workflow compiles cleanly, starts at ``portfolio``, and routes to ``observer``."""
     compiled = build_agent_graph()
     assert compiled is not None
     assert app is not None
     assert hasattr(agent_graph, "app")
 
-    node_names = set(compiled.get_graph().nodes.keys())
-    assert {"observer", "alpha", "risk", "executor"}.issubset(node_names)
+    graph_view = compiled.get_graph()
+    node_names = set(graph_view.nodes.keys())
+    assert {"portfolio", "observer", "alpha", "risk", "executor"}.issubset(node_names)
+
+    edges = {(edge.source, edge.target) for edge in graph_view.edges}
+    assert ("__start__", "portfolio") in edges
+    assert ("portfolio", "observer") in edges
