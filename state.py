@@ -18,8 +18,8 @@ class AgentState(TypedDict):
         account_data: Alpaca account balances, buying power, and status dictionary.
         open_positions: List of currently held open positions from Alpaca.
         active_orders: List of currently active/open orders from Alpaca.
-        action: Autonomous quant manager action (``"MARKET_BUY"``, ``"LIMIT_BUY"``, ``"CANCEL_ALL"``, or ``"HOLD"``).
-        target_price: Optional limit entry price specified by the LLM for ``"LIMIT_BUY"``.
+        action: Autonomous quant manager action (``"MARKET_BUY"``, ``"LIMIT_BUY"``, ``"MARKET_SELL"``, ``"LIMIT_SELL"``, ``"CANCEL_ALL"``, or ``"HOLD"``).
+        target_price: Optional limit price specified by the LLM for ``"LIMIT_BUY"`` or ``"LIMIT_SELL"``.
         rationale: Concise quantitative reasoning produced by the LLM for the selected action.
     """
 

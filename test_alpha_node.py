@@ -128,6 +128,9 @@ def test_alpha_logic_gate_node_injects_portfolio_state_and_returns_limit_buy(
     assert "399916.80" in system_content
     assert "BTCUSD" in system_content
     assert "LIMIT_BUY" in system_content
+    assert "LIMIT_SELL" in system_content
+    assert "MARKET_SELL" in system_content
+    assert "avg_entry_price" in system_content
     assert "CANCEL_ALL" in system_content
     assert "Window Summary (3 bars)" in human_content
     assert "BTC/USD" in human_content
@@ -143,6 +146,30 @@ def test_alpha_logic_gate_node_injects_portfolio_state_and_returns_limit_buy(
     assert "[Alpha] Action: LIMIT_BUY" in captured
     assert "90400.0" in captured
     assert "structural support" in captured
+
+
+def test_alpha_logic_gate_node_supports_limit_sell_and_market_sell(
+    populated_state: AgentState,
+) -> None:
+    """Verify ``SentimentResponse`` and ``alpha_logic_gate_node`` support ``LIMIT_SELL`` and ``MARKET_SELL``."""
+    mock_structured_llm = MagicMock()
+    mock_structured_llm.invoke.return_value = SentimentResponse(
+        action="LIMIT_SELL",
+        target_price=92500.0,
+        rationale="Position is +2.6% above avg_entry_price; taking profit at resistance.",
+        sentiment_score=0.62,
+    )
+
+    mock_llm_instance = MagicMock()
+    mock_llm_instance.with_structured_output.return_value = mock_structured_llm
+
+    with patch("alpha_node.ChatGoogleGenerativeAI", return_value=mock_llm_instance):
+        updated_state = alpha_logic_gate_node(populated_state)
+
+    _assert_valid_agent_state(updated_state)
+    assert updated_state["action"] == "LIMIT_SELL"
+    assert updated_state["target_price"] == pytest.approx(92500.0)
+    assert "taking profit" in updated_state["rationale"]
 
 
 def test_alpha_logic_gate_node_api_failure_defaults_hold_and_zero_score(

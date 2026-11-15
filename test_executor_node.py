@@ -118,6 +118,7 @@ def test_execution_node_limit_buy_uses_target_price_and_logs_to_duckdb() -> None
 
         mock_mcp.assert_called_once()
         passed_details = mock_mcp.call_args.args[0]
+        assert passed_details["side"] == "buy"
         assert passed_details["type"] == "limit"
         assert passed_details["qty"] == "0.000263"
         assert passed_details["limit_price"] == "94250.5"
@@ -162,6 +163,7 @@ def test_execution_node_market_buy_submits_market_order() -> None:
 
         mock_mcp.assert_called_once()
         passed_details = mock_mcp.call_args.args[0]
+        assert passed_details["side"] == "buy"
         assert passed_details["type"] == "market"
         assert passed_details["qty"] == "0.000263"
         assert "limit_price" not in passed_details
@@ -169,6 +171,61 @@ def test_execution_node_market_buy_submits_market_order() -> None:
         _assert_valid_agent_state(updated_state)
         assert updated_state["order_details"]["trade_id"] == "mock-market-trade-002"
         assert updated_state["order_details"]["action"] == "MARKET_BUY"
+    finally:
+        in_mem_conn.close()
+
+
+def test_execution_node_limit_sell_and_market_sell_pass_side_sell() -> None:
+    """Verify ``LIMIT_SELL`` and ``MARKET_SELL`` pass ``side='sell'`` with string ``qty``/``limit_price``."""
+    in_mem_conn = duckdb.connect(":memory:")
+    conn_proxy = _PersistentInMemoryConn(in_mem_conn)
+
+    try:
+        limit_sell_state = _build_ready_state(
+            risk_cleared=True,
+            action="LIMIT_SELL",
+            target_price=97500.0,
+        )
+        with (
+            patch(
+                "executor_node.place_crypto_order",
+                return_value="mock-limit-sell-001",
+            ) as mock_mcp,
+            patch("executor_node.duckdb.connect", return_value=conn_proxy),
+        ):
+            updated_limit_sell = execution_node(limit_sell_state)
+
+        passed_limit_sell = mock_mcp.call_args.args[0]
+        assert passed_limit_sell["side"] == "sell"
+        assert passed_limit_sell["type"] == "limit"
+        assert passed_limit_sell["qty"] == "0.000263"
+        assert passed_limit_sell["limit_price"] == "97500.0"
+        _assert_valid_agent_state(updated_limit_sell)
+        assert updated_limit_sell["order_details"]["action"] == "LIMIT_SELL"
+        assert updated_limit_sell["order_details"]["trade_id"] == "mock-limit-sell-001"
+
+        market_sell_state = _build_ready_state(
+            risk_cleared=True,
+            action="MARKET_SELL",
+            target_price=None,
+        )
+        with (
+            patch(
+                "executor_node.place_crypto_order",
+                return_value="mock-market-sell-002",
+            ) as mock_mcp,
+            patch("executor_node.duckdb.connect", return_value=conn_proxy),
+        ):
+            updated_market_sell = execution_node(market_sell_state)
+
+        passed_market_sell = mock_mcp.call_args.args[0]
+        assert passed_market_sell["side"] == "sell"
+        assert passed_market_sell["type"] == "market"
+        assert passed_market_sell["qty"] == "0.000263"
+        assert "limit_price" not in passed_market_sell
+        _assert_valid_agent_state(updated_market_sell)
+        assert updated_market_sell["order_details"]["action"] == "MARKET_SELL"
+        assert updated_market_sell["order_details"]["trade_id"] == "mock-market-sell-002"
     finally:
         in_mem_conn.close()
 

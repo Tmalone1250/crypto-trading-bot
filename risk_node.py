@@ -134,10 +134,11 @@ def risk_manager_node(state: AgentState) -> AgentState:
             }
 
         target_price = current_price + (RISK_REWARD_RATIO * stop_distance)
-        order_type = "market" if action == "MARKET_BUY" else DEFAULT_ORDER_TYPE
+        side = "sell" if action in {"MARKET_SELL", "LIMIT_SELL"} else "buy"
+        order_type = "market" if action in {"MARKET_BUY", "MARKET_SELL"} else DEFAULT_ORDER_TYPE
         limit_entry_price = (
             float(state["target_price"])
-            if action == "LIMIT_BUY" and state.get("target_price") is not None
+            if action in {"LIMIT_BUY", "LIMIT_SELL"} and state.get("target_price") is not None
             else float(round(current_price, 2))
         )
 
@@ -146,7 +147,7 @@ def risk_manager_node(state: AgentState) -> AgentState:
             "risk_cleared": True,
             "order_details": {
                 "symbol": symbol,
-                "side": "buy",
+                "side": side,
                 "order_type": order_type,
                 "time_in_force": DEFAULT_TIME_IN_FORCE,
                 "limit_price": limit_entry_price,

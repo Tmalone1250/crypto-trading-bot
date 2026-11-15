@@ -270,10 +270,27 @@ def execution_node(state: AgentState) -> AgentState:
         order_details["qty"] = str(raw_qty)
 
         if action == "MARKET_BUY":
+            order_details["side"] = "buy"
             order_details["type"] = "market"
             order_details["order_type"] = "market"
             order_details.pop("limit_price", None)
         elif action == "LIMIT_BUY":
+            order_details["side"] = "buy"
+            order_details["type"] = "limit"
+            order_details["order_type"] = "limit"
+            target_limit = (
+                state.get("target_price")
+                if state.get("target_price") is not None
+                else order_details.get("limit_price", state["current_price"])
+            )
+            order_details["limit_price"] = str(target_limit)
+        elif action == "MARKET_SELL":
+            order_details["side"] = "sell"
+            order_details["type"] = "market"
+            order_details["order_type"] = "market"
+            order_details.pop("limit_price", None)
+        elif action == "LIMIT_SELL":
+            order_details["side"] = "sell"
             order_details["type"] = "limit"
             order_details["order_type"] = "limit"
             target_limit = (
@@ -283,6 +300,7 @@ def execution_node(state: AgentState) -> AgentState:
             )
             order_details["limit_price"] = str(target_limit)
         else:
+            order_details.setdefault("side", "buy")
             if order_details.get("limit_price") is not None:
                 order_details["limit_price"] = str(order_details["limit_price"])
 

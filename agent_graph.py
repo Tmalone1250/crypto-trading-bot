@@ -18,7 +18,9 @@ from state import AgentState
 
 SENTIMENT_THRESHOLD: float = 0.5
 SCAN_INTERVAL_SECONDS: int = 60
-EXECUTABLE_ACTIONS: frozenset[str] = frozenset({"MARKET_BUY", "LIMIT_BUY", "CANCEL_ALL"})
+EXECUTABLE_ACTIONS: frozenset[str] = frozenset(
+    {"MARKET_BUY", "LIMIT_BUY", "MARKET_SELL", "LIMIT_SELL", "CANCEL_ALL"}
+)
 
 
 def route_after_observer(state: AgentState) -> str:
@@ -38,13 +40,14 @@ def route_after_observer(state: AgentState) -> str:
 
 
 def route_after_alpha(state: AgentState) -> str:
-    """Route ``MARKET_BUY``, ``LIMIT_BUY``, and ``CANCEL_ALL`` downstream, and ``HOLD`` to ``END``.
+    """Route buy, sell, and cancellation actions downstream, and ``HOLD`` to ``END``.
 
     Args:
         state: Current ``AgentState`` dictionary after Node 2 execution.
 
     Returns:
-        ``"risk"`` if ``action`` is in ``{"MARKET_BUY", "LIMIT_BUY", "CANCEL_ALL"}``,
+        ``"risk"`` if ``action`` is in
+        ``{"MARKET_BUY", "LIMIT_BUY", "MARKET_SELL", "LIMIT_SELL", "CANCEL_ALL"}``,
         otherwise ``END``.
     """
     action = str(state.get("action", "HOLD")).upper()

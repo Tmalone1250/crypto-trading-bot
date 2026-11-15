@@ -61,6 +61,8 @@ def test_route_after_observer(
     [
         ("MARKET_BUY", None, "risk"),
         ("LIMIT_BUY", 89500.0, "risk"),
+        ("MARKET_SELL", None, "risk"),
+        ("LIMIT_SELL", 93500.0, "risk"),
         ("CANCEL_ALL", None, "risk"),
         ("HOLD", None, END),
     ],
@@ -70,7 +72,7 @@ def test_route_after_alpha(
     target_price: float | None,
     expected: str,
 ) -> None:
-    """Verify ``route_after_alpha`` routes ``MARKET_BUY``, ``LIMIT_BUY``, ``CANCEL_ALL`` to ``risk`` and ``HOLD`` to ``END``."""
+    """Verify ``route_after_alpha`` routes buy, sell, and cancel actions to ``risk`` and ``HOLD`` to ``END``."""
     state = _make_state(action=action, target_price=target_price)
     assert route_after_alpha(state) == expected
 

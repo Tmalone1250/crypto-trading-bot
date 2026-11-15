@@ -25,20 +25,29 @@ GEMINI_MODEL = "gemini-3.5-flash-lite"
 class SentimentResponse(BaseModel):
     """Strict structured output schema enforced on the Gemini Alpha quant manager."""
 
-    action: Literal["MARKET_BUY", "LIMIT_BUY", "CANCEL_ALL", "HOLD"] = Field(
+    action: Literal[
+        "MARKET_BUY",
+        "LIMIT_BUY",
+        "MARKET_SELL",
+        "LIMIT_SELL",
+        "CANCEL_ALL",
+        "HOLD",
+    ] = Field(
         ...,
         description=(
             "Lifecycle action to execute: 'MARKET_BUY' for immediate market entry, "
-            "'LIMIT_BUY' to place a resting limit order at target_price (e.g., at a "
-            "structural support level), 'CANCEL_ALL' if the trade thesis is invalidated "
-            "and open orders must be pulled, or 'HOLD' to take no action."
+            "'LIMIT_BUY' to place a resting limit buy order at target_price, "
+            "'MARKET_SELL' for immediate market exit/profit-taking, "
+            "'LIMIT_SELL' to place a resting limit sell order at target_price, "
+            "'CANCEL_ALL' if the trade thesis is invalidated and open orders must be "
+            "pulled, or 'HOLD' to take no action."
         ),
     )
     target_price: Optional[float] = Field(
         default=None,
         description=(
-            "Target limit price when action is 'LIMIT_BUY' (required for 'LIMIT_BUY', "
-            "otherwise None)."
+            "Target limit price when action is 'LIMIT_BUY' or 'LIMIT_SELL' "
+            "(required for limit orders, otherwise None)."
         ),
     )
     rationale: str = Field(
@@ -171,11 +180,19 @@ def alpha_logic_gate_node(state: AgentState) -> AgentState:
         "warrant immediate entry (set target_price to null).\n"
         "- LIMIT_BUY: Place a resting limit buy order at a specific structural support or "
         "pullback level (you MUST provide target_price as a float).\n"
+        "- MARKET_SELL: Execute an immediate market sell order to take profit or exit an "
+        "open position immediately (set target_price to null).\n"
+        "- LIMIT_SELL: Place a resting limit sell order at structural resistance or a "
+        "target profit level (you MUST provide target_price as a float).\n"
         "- CANCEL_ALL: Cancel all active open orders when the market thesis is invalidated, "
         "price has moved away from resting limit levels, or risk must be pulled (set "
         "target_price to null).\n"
         "- HOLD: Take no action when current exposure and resting orders are appropriate or "
         "no high-conviction setup is present (set target_price to null).\n\n"
+        "If you hold an open position, constantly evaluate the current price against your "
+        "position's avg_entry_price. If the market reaches structural resistance or a "
+        "profitable target (e.g., +2%), you MUST issue a LIMIT_SELL or MARKET_SELL to take "
+        "profit and lock in gains.\n\n"
         "Always provide a concise quantitative rationale and a sentiment_score strictly "
         "between -1.0 (strongly bearish) and 1.0 (strongly bullish).\n\n"
         f"=== CURRENT PORTFOLIO STATE ===\n{portfolio_context}"
