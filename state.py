@@ -13,12 +13,14 @@ class AgentState(TypedDict):
         historical_data: OHLCV candlestick DataFrame used for pattern and ATR math.
         sentiment_score: Polarity score from Node 2 (Gemini Alpha) in ``[-1.0, 1.0]``.
         risk_cleared: Gate flag set by Node 3 (TA-Lib Risk Manager).
-        order_details: Execution payload and metadata populated by Node 4.
+        order_details: Execution payload and metadata populated by Node 3 and Node 4.
         error_message: Optional error string captured when a node fails gracefully.
         account_data: Alpaca account balances, buying power, and status dictionary.
         open_positions: List of currently held open positions from Alpaca.
         active_orders: List of currently active/open orders from Alpaca.
-        decision: Autonomous quant manager decision from Node 2 (``"BUY"``, ``"SELL"``, or ``"HOLD"``).
+        action: Autonomous quant manager action (``"MARKET_BUY"``, ``"LIMIT_BUY"``, ``"CANCEL_ALL"``, or ``"HOLD"``).
+        target_price: Optional limit entry price specified by the LLM for ``"LIMIT_BUY"``.
+        rationale: Concise quantitative reasoning produced by the LLM for the selected action.
     """
 
     asset_symbol: str
@@ -31,4 +33,6 @@ class AgentState(TypedDict):
     account_data: dict[str, Any]
     open_positions: list[dict[str, Any]]
     active_orders: list[dict[str, Any]]
-    decision: str
+    action: str
+    target_price: Optional[float]
+    rationale: str

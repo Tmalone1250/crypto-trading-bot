@@ -18,6 +18,7 @@ from state import AgentState
 
 SENTIMENT_THRESHOLD: float = 0.5
 SCAN_INTERVAL_SECONDS: int = 60
+EXECUTABLE_ACTIONS: frozenset[str] = frozenset({"MARKET_BUY", "LIMIT_BUY", "CANCEL_ALL"})
 
 
 def route_after_observer(state: AgentState) -> str:
@@ -37,16 +38,17 @@ def route_after_observer(state: AgentState) -> str:
 
 
 def route_after_alpha(state: AgentState) -> str:
-    """Route to ``risk`` for ``BUY``/``SELL`` decisions, or ``END`` when ``HOLD``.
+    """Route ``MARKET_BUY``, ``LIMIT_BUY``, and ``CANCEL_ALL`` downstream, and ``HOLD`` to ``END``.
 
     Args:
         state: Current ``AgentState`` dictionary after Node 2 execution.
 
     Returns:
-        ``"risk"`` if ``decision`` is ``"BUY"`` or ``"SELL"``, otherwise ``END``.
+        ``"risk"`` if ``action`` is in ``{"MARKET_BUY", "LIMIT_BUY", "CANCEL_ALL"}``,
+        otherwise ``END``.
     """
-    decision = str(state.get("decision", "HOLD")).upper()
-    if decision in {"BUY", "SELL"}:
+    action = str(state.get("action", "HOLD")).upper()
+    if action in EXECUTABLE_ACTIONS:
         return "risk"
     return END
 
@@ -127,7 +129,9 @@ if __name__ == "__main__":
             "account_data": {},
             "open_positions": [],
             "active_orders": [],
-            "decision": "HOLD",
+            "action": "HOLD",
+            "target_price": None,
+            "rationale": "",
         }
 
         try:

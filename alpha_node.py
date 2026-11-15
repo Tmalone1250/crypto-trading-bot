@@ -1,14 +1,15 @@
 """Node 2: Alpha Logic Gate (Autonomous Quant Manager) for the LangGraph execution engine.
 
 Uses ``ChatGoogleGenerativeAI`` (``gemini-3.5-flash-lite``) with Pydantic
-structured output to evaluate the agent's live portfolio exposure (buying power
-and open positions) against a condensed summary of recent OHLCV price action,
-returning a structured trading decision (``BUY``, ``SELL``, or ``HOLD``) and a
-bounded sentiment polarity score in ``[-1.0, 1.0]``.
+structured output to evaluate the agent's live portfolio exposure (buying power,
+open positions, and active open orders) against a condensed summary of recent
+OHLCV price action, returning a structured lifecycle action
+(``MARKET_BUY``, ``LIMIT_BUY``, ``CANCEL_ALL``, or ``HOLD``), an optional
+``target_price``, a ``rationale``, and a bounded ``sentiment_score`` in ``[-1.0, 1.0]``.
 """
 
 import os
-from typing import Literal
+from typing import Literal, Optional
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -24,15 +25,28 @@ GEMINI_MODEL = "gemini-3.5-flash-lite"
 class SentimentResponse(BaseModel):
     """Strict structured output schema enforced on the Gemini Alpha quant manager."""
 
-    decision: Literal["BUY", "SELL", "HOLD"] = Field(
+    action: Literal["MARKET_BUY", "LIMIT_BUY", "CANCEL_ALL", "HOLD"] = Field(
         ...,
         description=(
-            "Autonomous portfolio action: 'BUY' to enter or add exposure, "
-            "'SELL' to exit or reduce exposure, or 'HOLD' to take no action."
+            "Lifecycle action to execute: 'MARKET_BUY' for immediate market entry, "
+            "'LIMIT_BUY' to place a resting limit order at target_price (e.g., at a "
+            "structural support level), 'CANCEL_ALL' if the trade thesis is invalidated "
+            "and open orders must be pulled, or 'HOLD' to take no action."
         ),
     )
-    sentiment_score: float = Field(
+    target_price: Optional[float] = Field(
+        default=None,
+        description=(
+            "Target limit price when action is 'LIMIT_BUY' (required for 'LIMIT_BUY', "
+            "otherwise None)."
+        ),
+    )
+    rationale: str = Field(
         ...,
+        description="Concise quantitative rationale explaining the selected action.",
+    )
+    sentiment_score: float = Field(
+        default=0.0,
         ge=-1.0,
         le=1.0,
         description=(
@@ -43,7 +57,7 @@ class SentimentResponse(BaseModel):
 
 
 def _format_portfolio_context(state: AgentState) -> str:
-    """Format available buying power and current open positions from ``AgentState``."""
+    """Format available buying power, open positions, and active orders from ``AgentState``."""
     account = state.get("account_data") or {}
     buying_power = account.get("buying_power", account.get("cash", "0.00"))
     cash = account.get("cash", "N/A")
@@ -67,11 +81,29 @@ def _format_portfolio_context(state: AgentState) -> str:
             )
         holdings_text = "\n".join(lines)
 
+    orders = state.get("active_orders") or []
+    if not orders:
+        orders_text = "None (no resting open orders)"
+    else:
+        order_lines = []
+        for ord_item in orders:
+            oid = ord_item.get("id", "UNKNOWN")
+            sym = ord_item.get("symbol", "UNKNOWN")
+            side = ord_item.get("side", "buy")
+            otype = ord_item.get("type", "limit")
+            lprice = ord_item.get("limit_price", "N/A")
+            qty = ord_item.get("qty", "N/A")
+            order_lines.append(
+                f"- id={oid}: {sym} {side} {otype} qty={qty} limit_price={lprice}"
+            )
+        orders_text = "\n".join(order_lines)
+
     return (
         f"Available Buying Power: ${buying_power}\n"
         f"Cash Balance: ${cash}\n"
         f"Portfolio Value: ${portfolio_value}\n"
-        f"Current Holdings:\n{holdings_text}"
+        f"Current Holdings:\n{holdings_text}\n"
+        f"Active Open Orders:\n{orders_text}"
     )
 
 
@@ -100,12 +132,13 @@ def _format_condensed_market_summary(state: AgentState, lookback: int = 10) -> s
 
 
 def alpha_logic_gate_node(state: AgentState) -> AgentState:
-    """Evaluate portfolio exposure against market data with Gemini and output a decision.
+    """Evaluate portfolio exposure against market data with Gemini and output a lifecycle action.
 
     Uses ``gemini-3.5-flash-lite`` with Pydantic structured output to return
-    ``decision`` (``BUY``, ``SELL``, or ``HOLD``) and ``sentiment_score`` in
-    ``[-1.0, 1.0]``. If ``historical_data`` is empty or the Gemini API fails,
-    safely defaults ``decision`` to ``"HOLD"`` and ``sentiment_score`` to ``0.0``.
+    ``action`` (``MARKET_BUY``, ``LIMIT_BUY``, ``CANCEL_ALL``, or ``HOLD``),
+    ``target_price``, ``rationale``, and ``sentiment_score``. If ``historical_data``
+    is empty or the Gemini API fails, safely defaults to ``action="HOLD"``,
+    ``target_price=None``, ``rationale=""``, and ``sentiment_score=0.0``.
 
     Args:
         state: Current ``AgentState`` dictionary.
@@ -119,7 +152,9 @@ def alpha_logic_gate_node(state: AgentState) -> AgentState:
     if df is None or df.empty:
         return {
             **state,
-            "decision": "HOLD",
+            "action": "HOLD",
+            "target_price": None,
+            "rationale": "Insufficient market data to evaluate setup.",
             "sentiment_score": 0.0,
             "error_message": f"Cannot compute alpha sentiment for {symbol}: historical_data is empty.",
         }
@@ -128,19 +163,27 @@ def alpha_logic_gate_node(state: AgentState) -> AgentState:
     market_summary = _format_condensed_market_summary(state)
 
     system_prompt = (
-        "You are an autonomous quantitative crypto portfolio manager. "
-        "Evaluate your current portfolio exposure (available buying power and open "
-        "holdings) against the recent market data summary. "
-        "Decide whether to BUY (open/add a long position), SELL (close/reduce an "
-        "existing position), or HOLD (stay flat or maintain current exposure without "
-        "placing a new order), and output a sentiment_score strictly between -1.0 "
-        "(strongly bearish) and 1.0 (strongly bullish).\n\n"
+        "You are an autonomous quantitative crypto portfolio manager with full order "
+        "lifecycle authority. Evaluate your current portfolio exposure (available buying "
+        "power, open positions, and active open orders) against the recent market data "
+        "summary and choose exactly one action:\n"
+        "- MARKET_BUY: Execute an immediate market buy order when momentum and structure "
+        "warrant immediate entry (set target_price to null).\n"
+        "- LIMIT_BUY: Place a resting limit buy order at a specific structural support or "
+        "pullback level (you MUST provide target_price as a float).\n"
+        "- CANCEL_ALL: Cancel all active open orders when the market thesis is invalidated, "
+        "price has moved away from resting limit levels, or risk must be pulled (set "
+        "target_price to null).\n"
+        "- HOLD: Take no action when current exposure and resting orders are appropriate or "
+        "no high-conviction setup is present (set target_price to null).\n\n"
+        "Always provide a concise quantitative rationale and a sentiment_score strictly "
+        "between -1.0 (strongly bearish) and 1.0 (strongly bullish).\n\n"
         f"=== CURRENT PORTFOLIO STATE ===\n{portfolio_context}"
     )
 
     human_prompt = (
         f"=== MARKET DATA SUMMARY ===\n{market_summary}\n\n"
-        "Provide your structured decision (BUY, SELL, or HOLD) and sentiment_score."
+        "Output your structured SentimentResponse (action, target_price, rationale, sentiment_score)."
     )
 
     try:
@@ -156,20 +199,30 @@ def alpha_logic_gate_node(state: AgentState) -> AgentState:
                 HumanMessage(content=human_prompt),
             ]
         )
-        decision = str(result.decision).upper()
+        action = str(result.action).upper()
+        target_price = float(result.target_price) if result.target_price is not None else None
+        rationale = str(result.rationale)
         sentiment_score = float(result.sentiment_score)
-        print(f"[Alpha] Gemini Decision: {decision} | Sentiment Score: {sentiment_score}")
+
+        print(
+            f"[Alpha] Action: {action} | Target Price: {target_price} "
+            f"| Rationale: {rationale}"
+        )
 
         return {
             **state,
-            "decision": decision,
+            "action": action,
+            "target_price": target_price,
+            "rationale": rationale,
             "sentiment_score": sentiment_score,
             "error_message": None,
         }
     except Exception as exc:
         return {
             **state,
-            "decision": "HOLD",
+            "action": "HOLD",
+            "target_price": None,
+            "rationale": "",
             "sentiment_score": 0.0,
             "error_message": f"Alpha node error for {symbol}: {exc}",
         }

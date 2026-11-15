@@ -45,6 +45,19 @@ def risk_manager_node(state: AgentState) -> AgentState:
     symbol = state["asset_symbol"]
     df = state["historical_data"]
     current_price = float(state["current_price"])
+    action = str(state.get("action", "LIMIT_BUY")).upper()
+
+    if action == "CANCEL_ALL":
+        return {
+            **state,
+            "risk_cleared": True,
+            "order_details": {
+                "symbol": symbol,
+                "action": "CANCEL_ALL",
+                "dry_run": _is_dry_run(),
+            },
+            "error_message": None,
+        }
 
     if df is None or df.empty:
         return {
@@ -121,6 +134,12 @@ def risk_manager_node(state: AgentState) -> AgentState:
             }
 
         target_price = current_price + (RISK_REWARD_RATIO * stop_distance)
+        order_type = "market" if action == "MARKET_BUY" else DEFAULT_ORDER_TYPE
+        limit_entry_price = (
+            float(state["target_price"])
+            if action == "LIMIT_BUY" and state.get("target_price") is not None
+            else float(round(current_price, 2))
+        )
 
         return {
             **state,
@@ -128,9 +147,9 @@ def risk_manager_node(state: AgentState) -> AgentState:
             "order_details": {
                 "symbol": symbol,
                 "side": "buy",
-                "order_type": DEFAULT_ORDER_TYPE,
+                "order_type": order_type,
                 "time_in_force": DEFAULT_TIME_IN_FORCE,
-                "limit_price": float(round(current_price, 2)),
+                "limit_price": limit_entry_price,
                 "entry_price": float(current_price),
                 "stop_loss_price": float(round(stop_loss_price, 6)),
                 "target_price": float(round(target_price, 6)),

@@ -1,9 +1,10 @@
 """Node 4: Executor & Logger for the LangGraph execution engine.
 
-Guards order placement behind ``risk_cleared == True``, submits crypto-compliant
-``market`` or ``limit`` orders (with ``gtc`` or ``ioc`` ``time_in_force``) via
-``alpaca-mcp-server``'s ``place_crypto_order`` tool, and logs trade records to
-local ``DuckDB`` storage (``agent_trades.duckdb``).
+Guards execution behind ``risk_cleared == True``, routes the LLM's lifecycle
+``action`` (``MARKET_BUY``, ``LIMIT_BUY``, or ``CANCEL_ALL``) to the appropriate
+``alpaca-mcp-server`` MCP tool (``place_crypto_order`` or ``cancel_all_orders``),
+ensures all quantities and limit prices are explicitly cast to ``str``, and logs
+executed trades to local ``DuckDB`` storage (``agent_trades.duckdb``).
 """
 
 import asyncio
@@ -25,6 +26,7 @@ from state import AgentState
 load_dotenv()
 
 DB_PATH: str = "agent_trades.duckdb"
+CANCEL_ALL_TOOL_NAME: str = "cancel_all_orders"
 SUPPORTED_CRYPTO_ORDER_TYPES: frozenset[str] = frozenset({"market", "limit", "stop_limit"})
 SUPPORTED_CRYPTO_TIF: frozenset[str] = frozenset({"gtc", "ioc"})
 
@@ -38,8 +40,27 @@ def _is_dry_run() -> bool:
     return os.environ.get("TRADING_MODE", "dry_run").lower() != "production"
 
 
+def _build_server_params() -> StdioServerParameters:
+    """Construct ``StdioServerParameters`` for ``alpaca-mcp-server``."""
+    command = os.environ.get("ALPACA_MCP_COMMAND", "uvx")
+    args = shlex.split(os.environ.get("ALPACA_MCP_ARGS", "alpaca-mcp-server"))
+
+    env = dict(os.environ)
+    for key_name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
+        val = os.environ.get(key_name)
+        if val is not None:
+            env[key_name] = val
+    env.setdefault("ALPACA_PAPER_TRADE", "true" if _is_dry_run() else "false")
+
+    return StdioServerParameters(
+        command=command,
+        args=args,
+        env=env,
+    )
+
+
 def _extract_order_id(result: Any) -> str:
-    """Extract an order/trade ID from an MCP ``place_crypto_order`` ``CallToolResult``."""
+    """Extract an order/trade ID from an MCP ``CallToolResult`` (including FastMCP envelopes)."""
     is_error = bool(
         getattr(result, "is_error", False) or getattr(result, "isError", False)
     )
@@ -50,13 +71,17 @@ def _extract_order_id(result: Any) -> str:
             str(getattr(item, "text", item))
             for item in content
         ]
-        raise RuntimeError(" ".join(error_parts) or "Alpaca MCP order placement failed.")
+        raise RuntimeError(" ".join(error_parts) or "Alpaca MCP order execution failed.")
 
     structured = getattr(result, "structured_content", None)
     if structured is None:
         structured = getattr(result, "structuredContent", None)
-    if isinstance(structured, dict) and structured.get("id"):
-        return str(structured["id"])
+    if isinstance(structured, dict):
+        if structured.get("id"):
+            return str(structured["id"])
+        data_sec = structured.get("data")
+        if isinstance(data_sec, dict) and data_sec.get("id"):
+            return str(data_sec["id"])
 
     text = "\n".join(
         text_val
@@ -67,8 +92,12 @@ def _extract_order_id(result: Any) -> str:
     if text:
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, dict) and parsed.get("id"):
-                return str(parsed["id"])
+            if isinstance(parsed, dict):
+                if parsed.get("id"):
+                    return str(parsed["id"])
+                data_sec = parsed.get("data")
+                if isinstance(data_sec, dict) and data_sec.get("id"):
+                    return str(data_sec["id"])
         except json.JSONDecodeError:
             pass
 
@@ -81,22 +110,7 @@ def _extract_order_id(result: Any) -> str:
 
 async def _submit_crypto_order_mcp(arguments: dict[str, Any]) -> str:
     """Open an MCP stdio session to ``alpaca-mcp-server`` and invoke ``place_crypto_order``."""
-    command = os.environ.get("ALPACA_MCP_COMMAND", "uvx")
-    args = shlex.split(os.environ.get("ALPACA_MCP_ARGS", "alpaca-mcp-server"))
-
-    env = dict(os.environ)
-    for key_name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
-        val = os.environ.get(key_name)
-        if val is not None:
-            env[key_name] = val
-    env.setdefault("ALPACA_PAPER_TRADE", "true" if _is_dry_run() else "false")
-
-    server_params = StdioServerParameters(
-        command=command,
-        args=args,
-        env=env,
-    )
-
+    server_params = _build_server_params()
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
@@ -104,16 +118,45 @@ async def _submit_crypto_order_mcp(arguments: dict[str, Any]) -> str:
             return _extract_order_id(result)
 
 
+async def _cancel_all_orders_mcp() -> Any:
+    """Open an MCP stdio session to ``alpaca-mcp-server`` and invoke ``cancel_all_orders``."""
+    server_params = _build_server_params()
+    async with stdio_client(server_params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            result = await session.call_tool(CANCEL_ALL_TOOL_NAME, arguments={})
+            is_error = bool(
+                getattr(result, "is_error", False) or getattr(result, "isError", False)
+            )
+            content = getattr(result, "content", None) or []
+            if is_error:
+                error_parts = [str(getattr(item, "text", item)) for item in content]
+                raise RuntimeError(
+                    " ".join(error_parts) or "Alpaca MCP cancel_all_orders failed."
+                )
+            return _extract_order_id(result)
+
+
+def cancel_all_orders() -> str:
+    """Cancel all open orders via ``alpaca-mcp-server``'s ``cancel_all_orders`` tool."""
+    return str(asyncio.run(_cancel_all_orders_mcp()))
+
+
+def cancel_orders() -> str:
+    """Alias for ``cancel_all_orders``."""
+    return cancel_all_orders()
+
+
 def place_crypto_order(order_details: dict[str, Any]) -> str:
     """Submit a crypto order via ``alpaca-mcp-server``'s ``place_crypto_order`` tool.
 
     Enforces Alpaca crypto constraints:
-      - ``order_type`` must be ``"market"``, ``"limit"``, or ``"stop_limit"``
-        (equities-only ``"bracket"`` orders are not used).
+      - ``type`` / ``order_type`` must be ``"market"``, ``"limit"``, or ``"stop_limit"``.
       - ``time_in_force`` must be ``"gtc"`` or ``"ioc"``.
+      - ``qty`` and ``limit_price`` are explicitly cast to ``str``.
 
     Args:
-        order_details: Order dictionary populated by Node 3.
+        order_details: Order dictionary populated by Node 3 / Node 4.
 
     Returns:
         Order/trade ID returned by ``alpaca-mcp-server``.
@@ -191,36 +234,73 @@ def _log_trade_to_duckdb(
 
 
 def execution_node(state: AgentState) -> AgentState:
-    """Execute a risk-cleared crypto order via Alpaca MCP and log to DuckDB.
+    """Execute the LLM's lifecycle action (``MARKET_BUY``, ``LIMIT_BUY``, ``CANCEL_ALL``) via MCP.
 
     Args:
         state: Current ``AgentState`` dictionary.
 
     Returns:
-        Updated ``AgentState`` dictionary with ``order_details["trade_id"]``
-        populated on success, or the original state if ``risk_cleared`` is False.
+        Updated ``AgentState`` dictionary with ``order_details`` updated on success,
+        or the original state if ``risk_cleared`` is False.
     """
     if state["risk_cleared"] is not True:
         return state
 
     symbol = state["asset_symbol"]
+    action = str(state.get("action", "LIMIT_BUY")).upper()
     order_details = dict(state["order_details"])
 
     try:
+        if action == "CANCEL_ALL":
+            cancel_id = cancel_all_orders()
+            updated_order_details = {
+                **order_details,
+                "action": "CANCEL_ALL",
+                "trade_id": cancel_id,
+            }
+            return {
+                **state,
+                "order_details": updated_order_details,
+                "error_message": None,
+            }
+
+        raw_qty = order_details.get(
+            "trade_qty", order_details.get("qty", order_details.get("position_size", 0.0))
+        )
+        order_details["qty"] = str(raw_qty)
+
+        if action == "MARKET_BUY":
+            order_details["type"] = "market"
+            order_details["order_type"] = "market"
+            order_details.pop("limit_price", None)
+        elif action == "LIMIT_BUY":
+            order_details["type"] = "limit"
+            order_details["order_type"] = "limit"
+            target_limit = (
+                state.get("target_price")
+                if state.get("target_price") is not None
+                else order_details.get("limit_price", state["current_price"])
+            )
+            order_details["limit_price"] = str(target_limit)
+        else:
+            if order_details.get("limit_price") is not None:
+                order_details["limit_price"] = str(order_details["limit_price"])
+
         trade_id = place_crypto_order(order_details)
         timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
 
         _log_trade_to_duckdb(
             trade_id=trade_id,
             symbol=symbol,
-            size=float(order_details["position_size"]),
-            stop_loss=float(order_details["stop_loss_price"]),
-            target=float(order_details["target_price"]),
+            size=float(order_details.get("position_size", raw_qty)),
+            stop_loss=float(order_details.get("stop_loss_price", 0.0)),
+            target=float(order_details.get("target_price", 0.0)),
             timestamp=timestamp,
         )
 
         updated_order_details = {
             **order_details,
+            "action": action,
             "trade_id": trade_id,
         }
 

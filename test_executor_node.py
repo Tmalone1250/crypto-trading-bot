@@ -1,4 +1,4 @@
-"""Unit tests for Node 4 (Executor & Logger) with crypto-compliant MCP order routing."""
+"""Unit tests for Node 4 (Executor & Logger) with full lifecycle action routing."""
 
 import json
 from types import SimpleNamespace
@@ -7,7 +7,12 @@ import duckdb
 import pandas as pd
 import pytest
 
-from executor_node import execution_node, place_crypto_order
+from executor_node import (
+    CANCEL_ALL_TOOL_NAME,
+    cancel_all_orders,
+    execution_node,
+    place_crypto_order,
+)
 from state import AgentState
 
 
@@ -22,7 +27,9 @@ REQUIRED_STATE_KEYS = {
     "account_data",
     "open_positions",
     "active_orders",
-    "decision",
+    "action",
+    "target_price",
+    "rationale",
 }
 
 
@@ -39,7 +46,9 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["account_data"], dict)
     assert isinstance(state["open_positions"], list)
     assert isinstance(state["active_orders"], list)
-    assert isinstance(state["decision"], str)
+    assert isinstance(state["action"], str)
+    assert state["target_price"] is None or isinstance(state["target_price"], float)
+    assert isinstance(state["rationale"], str)
 
 
 class _PersistentInMemoryConn:
@@ -55,7 +64,11 @@ class _PersistentInMemoryConn:
         pass
 
 
-def _build_ready_state(risk_cleared: bool) -> AgentState:
+def _build_ready_state(
+    risk_cleared: bool,
+    action: str = "LIMIT_BUY",
+    target_price: float | None = 94250.5,
+) -> AgentState:
     """Build a sample ``AgentState`` ready for Node 4 testing."""
     return {
         "asset_symbol": "BTC/USD",
@@ -79,13 +92,15 @@ def _build_ready_state(risk_cleared: bool) -> AgentState:
         "account_data": {},
         "open_positions": [],
         "active_orders": [],
-        "decision": "BUY",
+        "action": action,
+        "target_price": target_price,
+        "rationale": "Test execution rationale",
     }
 
 
-def test_execution_node_executes_and_logs_to_duckdb() -> None:
-    """Test A (Execution): ``risk_cleared=True`` calls ``place_crypto_order`` and logs to DuckDB."""
-    state = _build_ready_state(risk_cleared=True)
+def test_execution_node_limit_buy_uses_target_price_and_logs_to_duckdb() -> None:
+    """Verify ``LIMIT_BUY`` passes ``type='limit'`` and ``limit_price=str(state['target_price'])``."""
+    state = _build_ready_state(risk_cleared=True, action="LIMIT_BUY", target_price=94250.5)
     _assert_valid_agent_state(state)
 
     in_mem_conn = duckdb.connect(":memory:")
@@ -95,16 +110,22 @@ def test_execution_node_executes_and_logs_to_duckdb() -> None:
         with (
             patch(
                 "executor_node.place_crypto_order",
-                return_value="mock-crypto-trade-001",
+                return_value="mock-limit-trade-001",
             ) as mock_mcp,
             patch("executor_node.duckdb.connect", return_value=conn_proxy) as mock_db_connect,
         ):
             updated_state = execution_node(state)
 
-        mock_mcp.assert_called_once_with(state["order_details"])
+        mock_mcp.assert_called_once()
+        passed_details = mock_mcp.call_args.args[0]
+        assert passed_details["type"] == "limit"
+        assert passed_details["qty"] == "0.000263"
+        assert passed_details["limit_price"] == "94250.5"
+
         mock_db_connect.assert_called_once()
         _assert_valid_agent_state(updated_state)
-        assert updated_state["order_details"]["trade_id"] == "mock-crypto-trade-001"
+        assert updated_state["order_details"]["trade_id"] == "mock-limit-trade-001"
+        assert updated_state["order_details"]["action"] == "LIMIT_BUY"
         assert updated_state["error_message"] is None
 
         rows = in_mem_conn.execute(
@@ -112,7 +133,7 @@ def test_execution_node_executes_and_logs_to_duckdb() -> None:
         ).fetchall()
         assert len(rows) == 1
         trade_id, symbol, size, stop_loss, target = rows[0]
-        assert trade_id == "mock-crypto-trade-001"
+        assert trade_id == "mock-limit-trade-001"
         assert symbol == "BTC/USD"
         assert size == pytest.approx(0.000263)
         assert stop_loss == pytest.approx(93500.0)
@@ -121,26 +142,97 @@ def test_execution_node_executes_and_logs_to_duckdb() -> None:
         in_mem_conn.close()
 
 
+def test_execution_node_market_buy_submits_market_order() -> None:
+    """Verify ``MARKET_BUY`` maps to ``type='market'`` with string ``qty`` and no ``limit_price``."""
+    state = _build_ready_state(risk_cleared=True, action="MARKET_BUY", target_price=None)
+    _assert_valid_agent_state(state)
+
+    in_mem_conn = duckdb.connect(":memory:")
+    conn_proxy = _PersistentInMemoryConn(in_mem_conn)
+
+    try:
+        with (
+            patch(
+                "executor_node.place_crypto_order",
+                return_value="mock-market-trade-002",
+            ) as mock_mcp,
+            patch("executor_node.duckdb.connect", return_value=conn_proxy),
+        ):
+            updated_state = execution_node(state)
+
+        mock_mcp.assert_called_once()
+        passed_details = mock_mcp.call_args.args[0]
+        assert passed_details["type"] == "market"
+        assert passed_details["qty"] == "0.000263"
+        assert "limit_price" not in passed_details
+
+        _assert_valid_agent_state(updated_state)
+        assert updated_state["order_details"]["trade_id"] == "mock-market-trade-002"
+        assert updated_state["order_details"]["action"] == "MARKET_BUY"
+    finally:
+        in_mem_conn.close()
+
+
+def test_execution_node_cancel_all_calls_cancel_all_orders_mcp() -> None:
+    """Verify ``CANCEL_ALL`` maps to ``cancel_all_orders`` without placing an order."""
+    state = _build_ready_state(risk_cleared=True, action="CANCEL_ALL", target_price=None)
+    _assert_valid_agent_state(state)
+
+    mock_tool_result = SimpleNamespace(
+        is_error=False,
+        structured_content={"data": {"id": "cancel-batch-001"}},
+        content=[SimpleNamespace(text=json.dumps({"data": {"id": "cancel-batch-001"}}))],
+    )
+
+    mock_session = MagicMock()
+    mock_session.initialize = AsyncMock()
+    mock_session.call_tool = AsyncMock(return_value=mock_tool_result)
+
+    mock_session_cm = MagicMock()
+    mock_session_cm.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_cm.__aexit__ = AsyncMock(return_value=None)
+
+    mock_stdio_cm = MagicMock()
+    mock_stdio_cm.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock()))
+    mock_stdio_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch("executor_node.stdio_client", return_value=mock_stdio_cm),
+        patch("executor_node.ClientSession", return_value=mock_session_cm),
+        patch("executor_node.place_crypto_order") as mock_place_order,
+    ):
+        updated_state = execution_node(state)
+
+    mock_place_order.assert_not_called()
+    mock_session.call_tool.assert_awaited_once_with(CANCEL_ALL_TOOL_NAME, arguments={})
+    _assert_valid_agent_state(updated_state)
+    assert updated_state["order_details"]["action"] == "CANCEL_ALL"
+    assert updated_state["order_details"]["trade_id"] == "cancel-batch-001"
+    assert updated_state["error_message"] is None
+
+
 def test_execution_node_safety_guard_blocks_when_risk_not_cleared() -> None:
-    """Test B (Safety Guard): ``risk_cleared=False`` never calls ``place_crypto_order`` or DuckDB."""
+    """Test B (Safety Guard): ``risk_cleared=False`` never calls MCP or DuckDB."""
     state = _build_ready_state(risk_cleared=False)
     _assert_valid_agent_state(state)
 
     with (
         patch("executor_node.place_crypto_order") as mock_mcp,
+        patch("executor_node.cancel_all_orders") as mock_cancel,
         patch("executor_node.duckdb.connect") as mock_db_connect,
     ):
         updated_state = execution_node(state)
 
     mock_mcp.assert_not_called()
+    mock_cancel.assert_not_called()
     mock_db_connect.assert_not_called()
     _assert_valid_agent_state(updated_state)
     assert updated_state == state
     assert "trade_id" not in updated_state["order_details"]
 
 
-def test_place_crypto_order_calls_mcp_and_validates_tif() -> None:
-    """Verify ``place_crypto_order`` invokes MCP ``place_crypto_order`` with ``gtc``/``ioc``."""
+def test_place_crypto_order_calls_mcp_with_string_casts_and_validates_tif() -> None:
+    """Verify ``place_crypto_order`` casts ``qty`` and ``limit_price`` to ``str`` and validates ``type``."""
     order_details = _build_ready_state(risk_cleared=True)["order_details"]
     expected_id = "276e2673-764b-4ab6-a611-caf665ca6340"
     mock_tool_result = SimpleNamespace(

@@ -30,7 +30,9 @@ REQUIRED_STATE_KEYS = {
     "account_data",
     "open_positions",
     "active_orders",
-    "decision",
+    "action",
+    "target_price",
+    "rationale",
 }
 
 
@@ -47,7 +49,9 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["account_data"], dict)
     assert isinstance(state["open_positions"], list)
     assert isinstance(state["active_orders"], list)
-    assert isinstance(state["decision"], str)
+    assert isinstance(state["action"], str)
+    assert state["target_price"] is None or isinstance(state["target_price"], float)
+    assert isinstance(state["rationale"], str)
 
 
 def _sample_mcp_bars(count: int = 3) -> list[dict]:
@@ -79,7 +83,9 @@ def base_state() -> AgentState:
         "account_data": {},
         "open_positions": [],
         "active_orders": [],
-        "decision": "HOLD",
+        "action": "HOLD",
+        "target_price": None,
+        "rationale": "",
     }
 
 
