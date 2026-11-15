@@ -11,6 +11,7 @@ from agent_graph import (
     route_after_alpha,
     route_after_observer,
     route_after_risk,
+    route_after_supervisor,
 )
 from state import AgentState
 
@@ -31,6 +32,7 @@ def _make_state(**overrides) -> AgentState:
         "action": "HOLD",
         "target_price": None,
         "rationale": "",
+        "market_regime": "FLAT",
     }
     base.update(overrides)
     return base
@@ -39,7 +41,7 @@ def _make_state(**overrides) -> AgentState:
 @pytest.mark.parametrize(
     ("has_data", "error_message", "expected"),
     [
-        (True, None, "alpha"),
+        (True, None, "supervisor"),
         (True, "Market observer error", END),
         (False, None, END),
         (False, "No market data returned", END),
@@ -50,10 +52,23 @@ def test_route_after_observer(
     error_message: str | None,
     expected: str,
 ) -> None:
-    """Verify ``route_after_observer`` short-circuits to ``END`` on errors or empty data."""
+    """Verify ``route_after_observer`` routes valid data to ``supervisor`` and errors to ``END``."""
     df = pd.DataFrame({"close": [90000.0]}) if has_data else pd.DataFrame()
     state = _make_state(historical_data=df, error_message=error_message)
     assert route_after_observer(state) == expected
+
+
+@pytest.mark.parametrize(
+    ("market_regime", "expected"),
+    [
+        ("ACTIVE", "alpha"),
+        ("FLAT", END),
+    ],
+)
+def test_route_after_supervisor(market_regime: str, expected: str) -> None:
+    """Verify ``route_after_supervisor`` routes ``ACTIVE`` to ``alpha`` and ``FLAT`` to ``END``."""
+    state = _make_state(market_regime=market_regime)
+    assert route_after_supervisor(state) == expected
 
 
 @pytest.mark.parametrize(
@@ -99,8 +114,10 @@ def test_graph_compiles_with_expected_nodes() -> None:
 
     graph_view = compiled.get_graph()
     node_names = set(graph_view.nodes.keys())
-    assert {"portfolio", "observer", "alpha", "risk", "executor"}.issubset(node_names)
+    assert {"portfolio", "observer", "supervisor", "alpha", "risk", "executor"}.issubset(node_names)
 
     edges = {(edge.source, edge.target) for edge in graph_view.edges}
     assert ("__start__", "portfolio") in edges
     assert ("portfolio", "observer") in edges
+    assert ("observer", "supervisor") in edges
+    assert ("supervisor", "alpha") in edges

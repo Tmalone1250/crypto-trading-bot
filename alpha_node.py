@@ -107,7 +107,10 @@ def _format_portfolio_context(state: AgentState) -> str:
             )
         orders_text = "\n".join(order_lines)
 
+    market_regime = str(state.get("market_regime", "ACTIVE")).upper()
+
     return (
+        f"Market Regime: {market_regime}\n"
         f"Available Buying Power: ${buying_power}\n"
         f"Cash Balance: ${cash}\n"
         f"Portfolio Value: ${portfolio_value}\n"

@@ -1,7 +1,7 @@
-"""LangGraph Traffic Cop: compiles the 5-node autonomous trading state machine.
+"""LangGraph Traffic Cop: compiles the 6-node Multi-Agent Swarm trading state machine.
 
-Wires ``portfolio`` -> ``observer`` -> ``alpha`` -> ``risk`` -> ``executor`` with
-deterministic conditional routing gates after Observer, Alpha, and Risk nodes.
+Wires ``portfolio`` -> ``observer`` -> ``supervisor`` -> ``alpha`` -> ``risk`` -> ``executor``
+with deterministic conditional routing gates after Observer, Supervisor, Alpha, and Risk nodes.
 """
 
 import os
@@ -15,6 +15,7 @@ from observer_node import market_observer_node
 from portfolio_node import portfolio_node
 from risk_node import risk_manager_node
 from state import AgentState
+from supervisor_node import supervisor_node
 
 SENTIMENT_THRESHOLD: float = 0.5
 SCAN_INTERVAL_SECONDS: int = 60
@@ -24,19 +25,34 @@ EXECUTABLE_ACTIONS: frozenset[str] = frozenset(
 
 
 def route_after_observer(state: AgentState) -> str:
-    """Route to ``alpha`` only when Node 1 populated ``historical_data`` without errors.
+    """Route to ``supervisor`` only when Node 1 populated ``historical_data`` without errors.
 
     Args:
         state: Current ``AgentState`` dictionary after Node 1 execution.
 
     Returns:
         ``END`` if ``error_message`` is set or ``historical_data`` is empty,
-        otherwise ``"alpha"``.
+        otherwise ``"supervisor"``.
     """
     df = state["historical_data"]
     if state["error_message"] is not None or df is None or df.empty:
         return END
-    return "alpha"
+    return "supervisor"
+
+
+def route_after_supervisor(state: AgentState) -> str:
+    """Route to ``alpha`` when ``market_regime == 'ACTIVE'``, otherwise short-circuit to ``END``.
+
+    Args:
+        state: Current ``AgentState`` dictionary after Supervisor execution.
+
+    Returns:
+        ``"alpha"`` if ``market_regime == "ACTIVE"``, otherwise ``END``.
+    """
+    regime = str(state.get("market_regime", "FLAT")).upper()
+    if regime == "ACTIVE":
+        return "alpha"
+    return END
 
 
 def route_after_alpha(state: AgentState) -> str:
@@ -74,19 +90,28 @@ def build_agent_graph():
     """Construct and compile the deterministic LangGraph trading workflow."""
     graph = StateGraph(AgentState)
 
-    # Register all five deterministic execution nodes.
+    # Register all six deterministic swarm execution nodes.
     graph.add_node("portfolio", portfolio_node)
     graph.add_node("observer", market_observer_node)
+    graph.add_node("supervisor", supervisor_node)
     graph.add_node("alpha", alpha_logic_gate_node)
     graph.add_node("risk", risk_manager_node)
     graph.add_node("executor", execution_node)
 
-    # Wire entry point (START -> portfolio -> observer) and conditional transitions.
+    # Wire entry point (START -> portfolio -> observer -> supervisor) and conditional transitions.
     graph.set_entry_point("portfolio")
     graph.add_edge("portfolio", "observer")
     graph.add_conditional_edges(
         "observer",
         route_after_observer,
+        {
+            "supervisor": "supervisor",
+            END: END,
+        },
+    )
+    graph.add_conditional_edges(
+        "supervisor",
+        route_after_supervisor,
         {
             "alpha": "alpha",
             END: END,
@@ -135,6 +160,7 @@ if __name__ == "__main__":
             "action": "HOLD",
             "target_price": None,
             "rationale": "",
+            "market_regime": "FLAT",
         }
 
         try:

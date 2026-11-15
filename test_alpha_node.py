@@ -22,6 +22,7 @@ REQUIRED_STATE_KEYS = {
     "action",
     "target_price",
     "rationale",
+    "market_regime",
 }
 
 
@@ -41,6 +42,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["action"], str)
     assert state["target_price"] is None or isinstance(state["target_price"], float)
     assert isinstance(state["rationale"], str)
+    assert isinstance(state["market_regime"], str)
 
 
 @pytest.fixture
@@ -91,6 +93,7 @@ def populated_state() -> AgentState:
         "action": "HOLD",
         "target_price": None,
         "rationale": "",
+        "market_regime": "ACTIVE",
     }
 
 
@@ -126,6 +129,7 @@ def test_alpha_logic_gate_node_injects_portfolio_state_and_returns_limit_buy(
     human_content = messages[1].content
 
     assert "399916.80" in system_content
+    assert "Market Regime: ACTIVE" in system_content
     assert "BTCUSD" in system_content
     assert "LIMIT_BUY" in system_content
     assert "LIMIT_SELL" in system_content

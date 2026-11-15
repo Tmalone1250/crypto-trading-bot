@@ -21,6 +21,7 @@ class AgentState(TypedDict):
         action: Autonomous quant manager action (``"MARKET_BUY"``, ``"LIMIT_BUY"``, ``"MARKET_SELL"``, ``"LIMIT_SELL"``, ``"CANCEL_ALL"``, or ``"HOLD"``).
         target_price: Optional limit price specified by the LLM for ``"LIMIT_BUY"`` or ``"LIMIT_SELL"``.
         rationale: Concise quantitative reasoning produced by the LLM for the selected action.
+        market_regime: Deterministic volatility regime from the Supervisor node (``"FLAT"`` or ``"ACTIVE"``).
     """
 
     asset_symbol: str
@@ -36,3 +37,4 @@ class AgentState(TypedDict):
     action: str
     target_price: Optional[float]
     rationale: str
+    market_regime: str

@@ -30,6 +30,7 @@ REQUIRED_STATE_KEYS = {
     "action",
     "target_price",
     "rationale",
+    "market_regime",
 }
 
 
@@ -49,6 +50,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["action"], str)
     assert state["target_price"] is None or isinstance(state["target_price"], float)
     assert isinstance(state["rationale"], str)
+    assert isinstance(state["market_regime"], str)
 
 
 class _PersistentInMemoryConn:
@@ -95,6 +97,7 @@ def _build_ready_state(
         "action": action,
         "target_price": target_price,
         "rationale": "Test execution rationale",
+        "market_regime": "ACTIVE",
     }
 
 
