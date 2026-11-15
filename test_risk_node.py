@@ -3,7 +3,13 @@
 import pandas as pd
 import pytest
 
-from risk_node import MAX_RISK_USD, risk_manager_node
+from risk_node import (
+    ACCOUNT_SIZE_USD,
+    MAX_RISK_USD,
+    MIN_CRYPTO_ORDER_SIZE,
+    QTY_PRECISION,
+    risk_manager_node,
+)
 from state import AgentState
 
 
@@ -51,14 +57,13 @@ def _build_synthetic_ohlcv(
     return pd.DataFrame(rows)
 
 
-def test_risk_manager_node_cleared_low_volatility() -> None:
-    """Test A (Cleared): Low-volatility data keeps 1.5x ATR risk <= $0.80."""
-    # With price ~100.0 and wick_spread=0.5 (TR ~1.0), 1.5x ATR ~1.5 -> $0.15 risk on $10.
-    df = _build_synthetic_ohlcv(num_candles=20, base_price=100.0, wick_spread=0.5)
+def test_risk_manager_node_cleared_low_volatility_and_btc_sizing() -> None:
+    """Test A (Cleared): $25 base size clears 0.0001 BTC min_order_size and 1.5x ATR risk <= $2.00."""
+    df = _build_synthetic_ohlcv(num_candles=20, base_price=95000.0, wick_spread=150.0)
     current_price = float(df["close"].iloc[-1])
 
     state: AgentState = {
-        "asset_symbol": "SOL/USD",
+        "asset_symbol": "BTC/USD",
         "current_price": current_price,
         "historical_data": df,
         "sentiment_score": 0.82,
@@ -75,17 +80,18 @@ def test_risk_manager_node_cleared_low_volatility() -> None:
     assert updated_state["error_message"] is None
 
     order = updated_state["order_details"]
-    assert order["order_type"] == "bracket"
+    assert order["order_type"] in {"limit", "market"}
+    assert order["time_in_force"] in {"gtc", "ioc"}
     assert order["dry_run"] is True
     assert order["stop_loss_price"] < current_price
     assert order["target_price"] > current_price
-    assert order["position_size"] > 0.0
+    assert order["position_size"] == pytest.approx(round(ACCOUNT_SIZE_USD / current_price, QTY_PRECISION))
+    assert order["position_size"] >= MIN_CRYPTO_ORDER_SIZE
     assert order["projected_dollar_risk"] <= MAX_RISK_USD
 
 
 def test_risk_manager_node_vetoed_high_volatility() -> None:
-    """Test B (Vetoed): High-volatility candle wicks push 1.5x ATR risk > $0.80."""
-    # With price ~100.0 and wick_spread=8.0 (TR ~16.0), 1.5x ATR ~24.0 -> $2.40 risk on $10.
+    """Test B (Vetoed): High-volatility candle wicks push 1.5x ATR risk above $2.00."""
     df = _build_synthetic_ohlcv(num_candles=20, base_price=100.0, wick_spread=8.0)
     current_price = float(df["close"].iloc[-1])
 

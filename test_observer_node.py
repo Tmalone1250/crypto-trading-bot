@@ -1,5 +1,6 @@
 """Unit tests for Node 1 (Market Observer) with Alpaca MCP & strategy filter."""
 
+from datetime import datetime, timedelta, timezone
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,6 +11,7 @@ import pytest
 from observer_node import (
     BAR_LIMIT,
     BAR_TIMEFRAME,
+    LOOKBACK_DAYS,
     _format_bars_dataframe,
     get_crypto_bars,
     market_observer_node,
@@ -126,17 +128,29 @@ def test_market_observer_node_api_timeout_sets_error_message(base_state: AgentSt
     assert updated_state["historical_data"].empty
 
 
-def test_format_bars_dataframe_parses_json_and_symbol_variants() -> None:
-    """Verify JSON string MCP payloads and ``BTCUSD`` vs ``BTC/USD`` keys parse cleanly."""
+def test_format_bars_dataframe_parses_json_and_fastmcp_text() -> None:
+    """Verify JSON string payloads, ``BTCUSD`` keys, and FastMCP text outputs parse cleanly."""
     payload = json.dumps({"bars": {"BTCUSD": _sample_mcp_bars(2)}})
     df = _format_bars_dataframe(payload, "BTC/USD")
     assert len(df) == 2
     assert df["close"].dtype == np.float64
     assert float(df["close"].iloc[-1]) == pytest.approx(90750.25)
 
+    fastmcp_text = (
+        "Historical Crypto Bars for BTC/USD:\n"
+        "Timestamp: 2026-11-14T00:00:00Z | Open: $90,000.00 | High: $90,600.00 | "
+        "Low: $89,900.00 | Close: $90,500.00 | Volume: 12.5\n"
+        "Timestamp: 2026-11-14T01:00:00Z | Open: $90,500.00 | High: $91,100.00 | "
+        "Low: $90,400.00 | Close: $90,950.50 | Volume: 15.2\n"
+    )
+    df_text = _format_bars_dataframe(fastmcp_text, "BTC/USD")
+    assert len(df_text) == 2
+    assert df_text["close"].dtype == np.float64
+    assert float(df_text["close"].iloc[-1]) == pytest.approx(90950.50)
 
-def test_get_crypto_bars_calls_mcp_stdio_session() -> None:
-    """Verify ``get_crypto_bars`` invokes ``alpaca-mcp-server`` via mocked MCP stdio."""
+
+def test_get_crypto_bars_calls_mcp_stdio_session_with_12_day_start() -> None:
+    """Verify ``get_crypto_bars`` passes ``symbols``, ``timeframe``, ``limit``, and 12-day ``start``."""
     bars = _sample_mcp_bars(2)
     mock_tool_result = SimpleNamespace(
         isError=False,
@@ -156,15 +170,25 @@ def test_get_crypto_bars_calls_mcp_stdio_session() -> None:
     mock_stdio_cm.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock()))
     mock_stdio_cm.__aexit__ = AsyncMock(return_value=None)
 
+    fixed_now = datetime(2026, 11, 14, 18, 0, 0, tzinfo=timezone.utc)
+    expected_start = (fixed_now - timedelta(days=LOOKBACK_DAYS)).isoformat()
+
     with (
         patch("observer_node.stdio_client", return_value=mock_stdio_cm),
         patch("observer_node.ClientSession", return_value=mock_session_cm),
+        patch("observer_node.datetime") as mock_dt,
     ):
+        mock_dt.now.return_value = fixed_now
         result = get_crypto_bars("BTC/USD", timeframe="1Hour", limit=250)
 
     mock_session.initialize.assert_awaited_once()
     mock_session.call_tool.assert_awaited_once_with(
         "get_crypto_bars",
-        arguments={"symbols": "BTC/USD", "timeframe": "1Hour", "limit": 250},
+        arguments={
+            "symbols": "BTC/USD",
+            "timeframe": "1Hour",
+            "limit": 250,
+            "start": expected_start,
+        },
     )
     assert json.loads(result)["bars"]["BTC/USD"] == bars

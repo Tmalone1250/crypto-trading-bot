@@ -1,14 +1,17 @@
 """Node 1: Market Observer node for the LangGraph execution engine.
 
 Connects to ``alpaca-mcp-server`` over MCP stdio transport to invoke
-``get_crypto_bars`` for the latest 250 hourly OHLCV candles, normalizes numeric
-types to ``float64``, and gates execution through ``strategy_filter.check_entry_signal``
-to preserve Node 2's 15 RPM Gemini free-tier rate limit.
+``get_crypto_bars`` for the latest 250 hourly OHLCV candles (with a 12-day UTC
+``start`` lookback), normalizes numeric types to ``float64``, and gates execution
+through ``strategy_filter.check_entry_signal`` to preserve Node 2's 15 RPM
+Gemini free-tier rate limit.
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import os
+import re
 import shlex
 from typing import Any
 
@@ -25,7 +28,19 @@ load_dotenv()
 
 BAR_TIMEFRAME: str = "1Hour"
 BAR_LIMIT: int = 250
+LOOKBACK_DAYS: int = 12
 OHLCV_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
+
+_NUM_PATTERN = r"[-+]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?"
+_TEXT_BAR_REGEX = re.compile(
+    rf"(?:(?:t|time|timestamp|date)\s*[:=]\s*(?P<timestamp>\S+).*?)?"
+    rf"(?:o|open)\s*[:=]\s*\$?(?P<open>{_NUM_PATTERN})\D+"
+    rf"(?:h|high)\s*[:=]\s*\$?(?P<high>{_NUM_PATTERN})\D+"
+    rf"(?:l|low)\s*[:=]\s*\$?(?P<low>{_NUM_PATTERN})\D+"
+    rf"(?:c|close)\s*[:=]\s*\$?(?P<close>{_NUM_PATTERN})\D+"
+    rf"(?:v|vol|volume)\s*[:=]\s*\$?(?P<volume>{_NUM_PATTERN})",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _extract_mcp_result(result: Any) -> Any:
@@ -73,6 +88,8 @@ async def _fetch_crypto_bars_mcp(
         env=env,
     )
 
+    start_iso = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).isoformat()
+
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
@@ -82,6 +99,7 @@ async def _fetch_crypto_bars_mcp(
                     "symbols": symbol,
                     "timeframe": timeframe,
                     "limit": limit,
+                    "start": start_iso,
                 },
             )
             return _extract_mcp_result(result)
@@ -93,9 +111,6 @@ def get_crypto_bars(
     limit: int = BAR_LIMIT,
 ) -> Any:
     """Invoke the ``alpaca-mcp-server`` ``get_crypto_bars`` tool via MCP stdio transport.
-
-    All exchange market data requests flow through ``alpaca-mcp-server`` rather
-    than raw ``requests`` or ``aiohttp`` HTTP calls.
 
     Args:
         symbol: Target crypto pair (e.g., ``"BTC/USD"``).
@@ -110,11 +125,15 @@ def get_crypto_bars(
 
 def _symbol_key_candidates(symbol: str) -> list[str]:
     """Generate ordered symbol key variants (e.g., ``BTC/USD`` and ``BTCUSD``)."""
-    candidates = [symbol, symbol.replace("/", ""), symbol.upper(), symbol.replace("/", "").upper()]
+    candidates = [
+        symbol,
+        symbol.replace("/", ""),
+        symbol.upper(),
+        symbol.replace("/", "").upper(),
+    ]
     if "/" not in symbol and len(symbol) > 3:
         candidates.append(f"{symbol[:-3]}/{symbol[-3:]}")
         candidates.append(f"{symbol[:-3]}/{symbol[-3:]}".upper())
-    # Preserve order while deduplicating.
     return list(dict.fromkeys(candidates))
 
 
@@ -133,7 +152,6 @@ def _extract_records_from_dict(payload: dict[str, Any], symbol: str) -> Any:
         for candidate in _symbol_key_candidates(symbol):
             if candidate in container:
                 return container[candidate]
-        # Fallback: if dict has a single symbol key, return its value.
         if len(container) == 1:
             only_val = next(iter(container.values()))
             if isinstance(only_val, list):
@@ -143,16 +161,55 @@ def _extract_records_from_dict(payload: dict[str, Any], symbol: str) -> Any:
     return []
 
 
+def _parse_fastmcp_text_bars(text: str) -> list[dict[str, Any]]:
+    """Parse FastMCP formatted text output for ``get_crypto_bars`` into bar dicts."""
+    records: list[dict[str, Any]] = []
+    for match in _TEXT_BAR_REGEX.finditer(text):
+        group = match.groupdict()
+        row: dict[str, Any] = {
+            "open": float(group["open"].replace(",", "")),
+            "high": float(group["high"].replace(",", "")),
+            "low": float(group["low"].replace(",", "")),
+            "close": float(group["close"].replace(",", "")),
+            "volume": float(group["volume"].replace(",", "")),
+        }
+        if group.get("timestamp"):
+            row["timestamp"] = group["timestamp"].rstrip(",;|")
+        records.append(row)
+    return records
+
+
+def _parse_string_payload(raw_text: str) -> Any:
+    """Parse a string MCP payload as JSON first, falling back to FastMCP text parsing."""
+    stripped = raw_text.strip()
+    if not stripped:
+        return []
+
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    # Check for embedded JSON object/array inside markdown/text output.
+    for start_char, end_char in (("{", "}"), ("[", "]")):
+        start_idx = stripped.find(start_char)
+        end_idx = stripped.rfind(end_char)
+        if start_idx != -1 and end_idx > start_idx:
+            try:
+                return json.loads(stripped[start_idx : end_idx + 1])
+            except json.JSONDecodeError:
+                pass
+
+    return _parse_fastmcp_text_bars(stripped)
+
+
 def _format_bars_dataframe(raw_bars: Any, symbol: str) -> pd.DataFrame:
     """Normalize an Alpaca MCP ``get_crypto_bars`` response into a ``float64`` OHLCV DataFrame.
 
-    Safely parses JSON string payloads and handles ``BTCUSD`` vs ``BTC/USD`` key variations.
+    Safely parses JSON strings, FastMCP text outputs, and ``BTCUSD`` vs ``BTC/USD`` keys.
     """
     if isinstance(raw_bars, str):
-        stripped = raw_bars.strip()
-        if not stripped:
-            return pd.DataFrame()
-        raw_bars = json.loads(stripped)
+        raw_bars = _parse_string_payload(raw_bars)
 
     if isinstance(raw_bars, pd.DataFrame):
         df = raw_bars.copy()
@@ -167,7 +224,6 @@ def _format_bars_dataframe(raw_bars: Any, symbol: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Support both full names and Alpaca abbreviated keys (o, h, l, c, v, t).
     rename_map = {
         "o": "open",
         "h": "high",
@@ -187,7 +243,7 @@ def _format_bars_dataframe(raw_bars: Any, symbol: str) -> pd.DataFrame:
         raise ValueError(f"Missing required OHLCV columns from MCP response: {missing}")
 
     if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         df = df.sort_values("timestamp").reset_index(drop=True)
 
     for col in OHLCV_COLUMNS:
