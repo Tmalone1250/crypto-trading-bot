@@ -161,10 +161,10 @@ def test_place_crypto_order_calls_mcp_and_validates_tif() -> None:
         arguments={
             "symbol": "BTC/USD",
             "side": "buy",
-            "order_type": "limit",
+            "type": "limit",
             "time_in_force": "gtc",
-            "qty": 0.000263,
-            "limit_price": 95000.0,
+            "qty": "0.000263",
+            "limit_price": "95000.0",
         },
     )
 

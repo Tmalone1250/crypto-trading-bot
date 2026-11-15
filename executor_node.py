@@ -120,9 +120,14 @@ def place_crypto_order(order_details: dict[str, Any]) -> str:
     """
     symbol = str(order_details["symbol"])
     side = str(order_details.get("side", "buy")).lower()
-    order_type = str(order_details.get("order_type", "limit")).lower()
+    order_type = str(
+        order_details.get("type", order_details.get("order_type", "limit"))
+    ).lower()
     time_in_force = str(order_details.get("time_in_force", "gtc")).lower()
-    qty = float(order_details["position_size"])
+    raw_qty = order_details.get(
+        "trade_qty", order_details.get("qty", order_details["position_size"])
+    )
+    qty_str = str(raw_qty)
 
     if order_type not in SUPPORTED_CRYPTO_ORDER_TYPES:
         raise ValueError(
@@ -139,14 +144,14 @@ def place_crypto_order(order_details: dict[str, Any]) -> str:
     mcp_args: dict[str, Any] = {
         "symbol": symbol,
         "side": side,
-        "order_type": order_type,
+        "type": order_type,
         "time_in_force": time_in_force,
-        "qty": qty,
+        "qty": qty_str,
     }
     if order_type in {"limit", "stop_limit"}:
         limit_price = order_details.get("limit_price", order_details.get("entry_price"))
         if limit_price is not None:
-            mcp_args["limit_price"] = float(limit_price)
+            mcp_args["limit_price"] = str(limit_price)
 
     return asyncio.run(_submit_crypto_order_mcp(mcp_args))
 
