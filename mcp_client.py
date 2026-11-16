@@ -15,19 +15,25 @@ from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from config import get_alpaca_paper_config
+
 load_dotenv()
 
 
 def build_alpaca_server_params(paper_trade_default: str | None = None) -> StdioServerParameters:
     """Construct ``StdioServerParameters`` for ``alpaca-mcp-server``."""
+    paper_cfg = get_alpaca_paper_config()
     command = os.environ.get("ALPACA_MCP_COMMAND", "uvx")
     args = shlex.split(os.environ.get("ALPACA_MCP_ARGS", "alpaca-mcp-server"))
 
     env = dict(os.environ)
-    for key_name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
-        val = os.environ.get(key_name)
-        if val is not None:
-            env[key_name] = val
+    if paper_cfg["api_key"]:
+        env["ALPACA_API_KEY"] = paper_cfg["api_key"]
+        env["APCA_API_KEY_ID"] = paper_cfg["api_key"]
+    if paper_cfg["secret_key"]:
+        env["ALPACA_SECRET_KEY"] = paper_cfg["secret_key"]
+        env["APCA_API_SECRET_KEY"] = paper_cfg["secret_key"]
+    env.setdefault("APCA_API_BASE_URL", paper_cfg["base_url"])
     if paper_trade_default is not None:
         env.setdefault("ALPACA_PAPER_TRADE", paper_trade_default)
 

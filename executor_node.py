@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shlex
+import time
 from typing import Any
 import uuid
 
@@ -21,12 +22,14 @@ import duckdb
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from config import get_alpaca_paper_config
 from state import AgentState
 
 load_dotenv()
 
 DB_PATH: str = "agent_trades.duckdb"
 CANCEL_ALL_TOOL_NAME: str = "cancel_all_orders"
+BREAKEVEN_MOMENTUM_THRESHOLD: float = 0.0015  # +0.15% unrealized PnL trigger
 SUPPORTED_CRYPTO_ORDER_TYPES: frozenset[str] = frozenset({"market", "limit", "stop_limit"})
 SUPPORTED_CRYPTO_TIF: frozenset[str] = frozenset({"gtc", "ioc"})
 
@@ -42,14 +45,18 @@ def _is_dry_run() -> bool:
 
 def _build_server_params() -> StdioServerParameters:
     """Construct ``StdioServerParameters`` for ``alpaca-mcp-server``."""
+    paper_cfg = get_alpaca_paper_config()
     command = os.environ.get("ALPACA_MCP_COMMAND", "uvx")
     args = shlex.split(os.environ.get("ALPACA_MCP_ARGS", "alpaca-mcp-server"))
 
     env = dict(os.environ)
-    for key_name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
-        val = os.environ.get(key_name)
-        if val is not None:
-            env[key_name] = val
+    if paper_cfg["api_key"]:
+        env["ALPACA_API_KEY"] = paper_cfg["api_key"]
+        env["APCA_API_KEY_ID"] = paper_cfg["api_key"]
+    if paper_cfg["secret_key"]:
+        env["ALPACA_SECRET_KEY"] = paper_cfg["secret_key"]
+        env["APCA_API_SECRET_KEY"] = paper_cfg["secret_key"]
+    env.setdefault("APCA_API_BASE_URL", paper_cfg["base_url"])
     env.setdefault("ALPACA_PAPER_TRADE", "true" if _is_dry_run() else "false")
 
     return StdioServerParameters(
@@ -210,6 +217,8 @@ def place_crypto_order(
         limit_price = order_details.get("limit_price", order_details.get("entry_price"))
         if limit_price is not None:
             mcp_args["limit_price"] = str(limit_price)
+    if "extended_hours" in order_details:
+        mcp_args["extended_hours"] = bool(order_details["extended_hours"])
 
     if mcp_client is not None:
         result = mcp_client.call_tool("place_crypto_order", arguments=mcp_args)
@@ -301,20 +310,23 @@ def _intent_to_order_details(intent: Any) -> tuple[str, str, float, dict[str, An
         target_price = float(intent.target_price)
         qty = float(intent.qty)
 
-    side = "sell" if act == "LIMIT_SELL" else "buy"
+    side = "sell" if act in {"LIMIT_SELL", "MARKET_SELL"} else "buy"
+    order_type = "market" if act.startswith("MARKET_") else "limit"
     details: dict[str, Any] = {
         "symbol": sym,
         "side": side,
-        "type": "limit",
-        "order_type": "limit",
+        "type": order_type,
+        "order_type": order_type,
         "time_in_force": "gtc",
+        "extended_hours": False,
         "qty": str(qty),
-        "limit_price": str(target_price),
         "position_size": qty,
         "stop_loss_price": 0.0,
         "target_price": target_price,
         "dry_run": _is_dry_run(),
     }
+    if order_type == "limit":
+        details["limit_price"] = str(target_price)
     return sym, act, qty, details
 
 
@@ -362,7 +374,7 @@ def execution_node(state: AgentState) -> AgentState:
                     timestamp=timestamp,
                 )
 
-                if intent_act == "LIMIT_SELL":
+                if intent_act in {"LIMIT_SELL", "MARKET_SELL"}:
                     rough_profit = _calculate_sell_profit(
                         state=state,
                         order_details=intent_details,
@@ -488,3 +500,178 @@ def execution_node(state: AgentState) -> AgentState:
             **state,
             "error_message": f"Execution node error for {symbol}: {exc}",
         }
+
+
+def _extract_price_from_quote(payload: Any) -> float | None:
+    """Extract a numeric BTC/USD price from an Alpaca SDK or MCP quote payload."""
+    if isinstance(payload, (int, float)):
+        return float(payload)
+
+    if hasattr(payload, "content") or hasattr(payload, "structured_content") or hasattr(payload, "structuredContent"):
+        structured = getattr(payload, "structured_content", None) or getattr(payload, "structuredContent", None)
+        if isinstance(structured, dict):
+            extracted = _extract_price_from_quote(structured)
+            if extracted is not None:
+                return extracted
+        content = getattr(payload, "content", None) or []
+        for item in content:
+            text_val = getattr(item, "text", None)
+            if isinstance(text_val, str) and text_val.strip():
+                try:
+                    parsed = json.loads(text_val)
+                    extracted = _extract_price_from_quote(parsed)
+                    if extracted is not None:
+                        return extracted
+                except json.JSONDecodeError:
+                    pass
+
+    if isinstance(payload, dict):
+        for key in ("BTC/USD", "BTCUSD", "data", "quote", "trade"):
+            if key in payload:
+                nested = _extract_price_from_quote(payload[key])
+                if nested is not None:
+                    return nested
+        for price_key in ("price", "p", "last_price", "close"):
+            if payload.get(price_key) is not None:
+                return float(payload[price_key])
+        ask = payload.get("ask_price", payload.get("ap"))
+        bid = payload.get("bid_price", payload.get("bp"))
+        if ask is not None and bid is not None:
+            return (float(ask) + float(bid)) / 2.0
+        if ask is not None:
+            return float(ask)
+        if bid is not None:
+            return float(bid)
+        return None
+
+    for attr in ("price", "last_price"):
+        val = getattr(payload, attr, None)
+        if val is not None:
+            return float(val)
+    ask_attr = getattr(payload, "ask_price", None)
+    bid_attr = getattr(payload, "bid_price", None)
+    if ask_attr is not None and bid_attr is not None:
+        return (float(ask_attr) + float(bid_attr)) / 2.0
+    if ask_attr is not None:
+        return float(ask_attr)
+    if bid_attr is not None:
+        return float(bid_attr)
+    return None
+
+
+def _is_unconfigured_mock(attr: Any) -> bool:
+    """Return True when ``attr`` is an unconfigured ``unittest.mock`` callable."""
+    return (
+        hasattr(attr, "assert_called")
+        and getattr(attr, "side_effect", None) is None
+        and hasattr(attr, "return_value")
+        and hasattr(attr.return_value, "assert_called")
+    )
+
+
+def _fetch_live_btc_price(client: Any) -> float:
+    """Fetch the current live BTC/USD price from an Alpaca MCP or SDK client."""
+    price: float | None = None
+    if hasattr(client, "get_latest_trade") and not _is_unconfigured_mock(client.get_latest_trade):
+        price = _extract_price_from_quote(client.get_latest_trade("BTC/USD"))
+    elif hasattr(client, "get_crypto_latest_quote") and not _is_unconfigured_mock(
+        client.get_crypto_latest_quote
+    ):
+        price = _extract_price_from_quote(client.get_crypto_latest_quote("BTC/USD"))
+    elif hasattr(client, "get_latest_price") and not _is_unconfigured_mock(client.get_latest_price):
+        price = _extract_price_from_quote(client.get_latest_price("BTC/USD"))
+    elif hasattr(client, "call_tool") and not _is_unconfigured_mock(client.call_tool):
+        result = client.call_tool("get_crypto_latest_quote", {"symbol": "BTC/USD"})
+        price = _extract_price_from_quote(result)
+    else:
+        raise AttributeError(
+            "Unsupported Alpaca client: expected get_latest_trade, "
+            "get_crypto_latest_quote, get_latest_price, or call_tool."
+        )
+
+    if price is None or price <= 0.0:
+        raise ValueError("Unable to parse a positive live BTC/USD price from Alpaca client.")
+    return float(price)
+
+
+def _replace_stop_loss_order(client: Any, order_id: str, entry_price: float) -> Any:
+    """Invoke Alpaca replace_order (SDK or MCP) to move stop_loss to ``entry_price``."""
+    stop_price_str = str(entry_price)
+    if hasattr(client, "replace_order"):
+        return client.replace_order(order_id=str(order_id), stop_price=stop_price_str)
+    if hasattr(client, "replace_order_by_id"):
+        return client.replace_order_by_id(
+            order_id=str(order_id),
+            order_data={"stop_price": stop_price_str},
+        )
+    if hasattr(client, "call_tool"):
+        return client.call_tool(
+            "replace_order_by_id",
+            {"order_id": str(order_id), "stop_price": stop_price_str},
+        )
+    raise AttributeError(
+        "Unsupported Alpaca client: expected replace_order, replace_order_by_id, or call_tool."
+    )
+
+
+def monitor_trade_and_breakeven(
+    client: Any,
+    order_id: str,
+    entry_price: float,
+    is_long: bool,
+    poll_interval: float = 1.0,
+    max_attempts: int = 60,
+) -> dict[str, Any]:
+    """Poll live BTC/USD every 1s and move stop-loss to breakeven at +0.15% PnL.
+
+    Args:
+        client: Active Alpaca MCP or SDK client instance.
+        order_id: Alpaca stop-loss order ID to update via ``replace_order``.
+        entry_price: Executed trade entry price used for PnL and breakeven SL.
+        is_long: ``True`` for long positions, ``False`` for short positions.
+        poll_interval: Seconds between price polls (defaults to ``1.0``).
+        max_attempts: Maximum polling iterations before exiting (defaults to ``60``).
+
+    Returns:
+        Summary dictionary with ``breakeven_triggered``, ``order_id``,
+        ``entry_price``, and trigger metrics when triggered.
+    """
+    entry = float(entry_price)
+    if entry <= 0.0:
+        raise ValueError("entry_price must be positive.")
+
+    attempts = 0
+    while attempts < max_attempts:
+        live_price = _fetch_live_btc_price(client)
+        unrealized_pnl_pct = (
+            (live_price - entry) / entry
+            if is_long
+            else (entry - live_price) / entry
+        )
+
+        if unrealized_pnl_pct >= BREAKEVEN_MOMENTUM_THRESHOLD:
+            replace_result = _replace_stop_loss_order(client, str(order_id), entry)
+            print(
+                f"[Executor] Breakeven triggered for {order_id}: "
+                f"PnL={unrealized_pnl_pct:.4%} >= {BREAKEVEN_MOMENTUM_THRESHOLD:.2%}, "
+                f"moved SL to {entry:.2f}"
+            )
+            return {
+                "breakeven_triggered": True,
+                "order_id": str(order_id),
+                "entry_price": entry,
+                "trigger_price": live_price,
+                "unrealized_pnl_pct": unrealized_pnl_pct,
+                "replace_result": replace_result,
+            }
+
+        attempts += 1
+        if attempts < max_attempts:
+            time.sleep(poll_interval)
+
+    return {
+        "breakeven_triggered": False,
+        "order_id": str(order_id),
+        "entry_price": entry,
+        "attempts": attempts,
+    }

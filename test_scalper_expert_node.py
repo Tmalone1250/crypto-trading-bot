@@ -1,8 +1,12 @@
 """Unit tests for the Multi-Asset Maker-Only Scalper Expert Node."""
 
+from datetime import datetime
+import duckdb
 import pandas as pd
 import pytest
 
+from risk_node import risk_manager_node
+import scalper_expert_node as scalper_mod
 from scalper_expert_node import TRANCHE_NOTIONAL_USD, scalper_expert_node
 from state import AgentState, TradeIntent
 
@@ -162,3 +166,355 @@ def test_scalper_multi_asset_loop_emits_maker_only_intents_list() -> None:
         "SOL/USD": "LIMIT_SELL",
     }
     assert all(i.action in {"LIMIT_BUY", "LIMIT_SELL"} for i in intents)
+
+
+def test_scalper_session_open_watch_phase_1_displacement_and_phase_2_entry(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify SESSION_OPEN_WATCH transitions PHASE_0 -> PHASE_1 -> PHASE_2 and routes 1.5R risk."""
+    db_file = str(tmp_path / "test_reversion.duckdb")
+    monkeypatch.setattr(scalper_mod, "DB_PATH", db_file)
+
+    conn = duckdb.connect(db_file)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE setup_state_machine (
+                setup_id VARCHAR PRIMARY KEY,
+                strategy VARCHAR NOT NULL,
+                phase VARCHAR NOT NULL,
+                sweep_low DOUBLE,
+                target_price DOUBLE,
+                timestamp TIMESTAMP NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO setup_state_machine (setup_id, strategy, phase, sweep_low, target_price, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ["NEW_YORK-202611160830-abc123", "FAIR_PRICE_REVERSION", "PHASE_0_ANCHORED", None, 100000.0, datetime(2026, 11, 16, 14, 30)],
+        )
+    finally:
+        conn.close()
+
+    # Phase 1: price drops -0.30% (99700 vs 100000 Fair Price >= 0.20%) -> PHASE_1_DISPLACED
+    df_phase1 = pd.DataFrame(
+        {
+            "open": [100000.0, 99850.0],
+            "high": [100020.0, 99880.0],
+            "low": [99800.0, 99650.0],
+            "close": [99850.0, 99700.0],
+        }
+    )
+    state_p1 = _base_state(
+        asset_symbols=["BTC/USD"],
+        market_data_by_symbol={"BTC/USD": df_phase1},
+    )
+    state_p1["market_regime"] = "SESSION_OPEN_WATCH"
+    state_p1["current_price"] = 99700.0
+
+    res_p1 = scalper_expert_node(state_p1)
+    assert res_p1["action"] == "HOLD"
+    assert res_p1["trade_intents"] == []
+
+    conn = duckdb.connect(db_file)
+    try:
+        phase_after_p1 = conn.execute(
+            "SELECT phase, sweep_low FROM setup_state_machine WHERE setup_id = 'NEW_YORK-202611160830-abc123'"
+        ).fetchone()
+        assert phase_after_p1 == ("PHASE_1_DISPLACED", 99650.0)
+    finally:
+        conn.close()
+
+    # Phase 2: 1m bullish displacement candle (body > prev body, closes past prev high)
+    df_phase2 = pd.DataFrame(
+        {
+            "open": [99700.0, 99690.0],
+            "high": [99740.0, 99860.0],
+            "low": [99650.0, 99680.0],
+            "close": [99690.0, 99850.0],
+        }
+    )
+    state_p2 = _base_state(
+        asset_symbols=["BTC/USD"],
+        market_data_by_symbol={"BTC/USD": df_phase2},
+    )
+    state_p2["market_regime"] = "SESSION_OPEN_WATCH"
+    state_p2["current_price"] = 99850.0
+
+    res_p2 = scalper_expert_node(state_p2)
+    assert len(res_p2["trade_intents"]) == 1
+    intent = res_p2["trade_intents"][0]
+    assert intent.action == "LIMIT_BUY"
+    assert intent.target_price == pytest.approx(99850.0)
+    assert intent.raw_stop_loss == pytest.approx(99650.0)
+
+    # Route through risk_manager_node to verify automatic 1.5R math
+    risk_out = risk_manager_node(res_p2)
+    assert risk_out["risk_cleared"] is True
+    assert risk_out["order_details"]["risk_reward_ratio"] == pytest.approx(1.5)
+    assert risk_out["order_details"]["stop_loss_price"] == pytest.approx(99650.0 * 0.9995)
+
+
+def test_scalper_crt_rebreak_full_multi_phase_state_transitions(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify CRT Re-break PHASE_1_SWEPT -> PHASE_2 -> PHASE_3 -> PHASE_4 and 1.5R handoff."""
+    db_file = str(tmp_path / "test_crt.duckdb")
+    monkeypatch.setattr(scalper_mod, "DB_PATH", db_file)
+
+    # Candle 1: H1=101000, L1=99000
+    # Candle 2: Sweeps L1 (L2=98600 < 99000), H2=99800, closes inside C1 (99400)
+    # Midpoint M = (99800 + 98600) / 2 = 99200; Target = H1 = 101000
+    df_1h = pd.DataFrame(
+        {
+            "open": [100000.0, 99500.0],
+            "high": [101000.0, 99800.0],
+            "low": [99000.0, 98600.0],
+            "close": [99600.0, 99400.0],
+        }
+    )
+    df_1m_neutral = pd.DataFrame(
+        {
+            "open": [99100.0, 99100.0, 99100.0, 99100.0, 99100.0],
+            "high": [99150.0, 99150.0, 99150.0, 99150.0, 99150.0],
+            "low": [99050.0, 99050.0, 99050.0, 99050.0, 99050.0],
+            "close": [99100.0, 99100.0, 99100.0, 99100.0, 99100.0],
+        }
+    )
+
+    def _make_crt_state(price: float) -> AgentState:
+        st = _base_state(
+            asset_symbols=["BTC/USD"],
+            market_data_by_symbol={
+                "BTC/USD": df_1m_neutral,
+                "BTC/USD_1H": df_1h,
+            },
+        )
+        st["market_regime"] = "FLAT"
+        st["current_price"] = price
+        return st
+
+    # Phase 1: Sweep & Midpoint Lock (price at 99100 < M=99200)
+    res1 = scalper_expert_node(_make_crt_state(99100.0))
+    assert res1["trade_intents"] == []
+
+    conn = duckdb.connect(db_file)
+    try:
+        row1 = conn.execute(
+            "SELECT strategy, phase, sweep_low, target_price FROM setup_state_machine LIMIT 1"
+        ).fetchone()
+        assert row1 == ("CRT_REBREAK", "PHASE_1_SWEPT", 99200.0, 101000.0)
+    finally:
+        conn.close()
+
+    # Phase 2: First Break above M (99250 > 99200) -> PHASE_2_FIRST_BREAK, no entry
+    res2 = scalper_expert_node(_make_crt_state(99250.0))
+    assert res2["trade_intents"] == []
+
+    conn = duckdb.connect(db_file)
+    try:
+        phase2 = conn.execute("SELECT phase FROM setup_state_machine LIMIT 1").fetchone()[0]
+        assert phase2 == "PHASE_2_FIRST_BREAK"
+    finally:
+        conn.close()
+
+    # Phase 3: Pullback below M (99150 < 99200) -> PHASE_3_PULLBACK
+    res3 = scalper_expert_node(_make_crt_state(99150.0))
+    assert res3["trade_intents"] == []
+
+    conn = duckdb.connect(db_file)
+    try:
+        phase3 = conn.execute("SELECT phase FROM setup_state_machine LIMIT 1").fetchone()[0]
+        assert phase3 == "PHASE_3_PULLBACK"
+    finally:
+        conn.close()
+
+    # Phase 4: Re-break above M (99220 >= 99200) -> emits LIMIT_BUY at M=99200
+    # Distance M to H1 = 101000 - 99200 = 1800 -> SL distance = 1800 / 1.5 = 1200 -> raw SL = 98000
+    res4 = scalper_expert_node(_make_crt_state(99220.0))
+    assert len(res4["trade_intents"]) == 1
+    intent = res4["trade_intents"][0]
+    assert intent.action == "LIMIT_BUY"
+    assert intent.target_price == pytest.approx(99200.0)
+    assert intent.raw_stop_loss == pytest.approx(98000.0)
+
+    conn = duckdb.connect(db_file)
+    try:
+        phase4 = conn.execute("SELECT phase FROM setup_state_machine LIMIT 1").fetchone()[0]
+        assert phase4 == "PHASE_4_EXECUTED"
+    finally:
+        conn.close()
+
+    # Verify risk_node.py consumes raw_stop_loss and computes 1.5R constraints
+    risk_out = risk_manager_node(res4)
+    assert risk_out["risk_cleared"] is True
+    assert risk_out["order_details"]["stop_loss_price"] == pytest.approx(98000.0 * 0.9995)
+    assert risk_out["order_details"]["risk_reward_ratio"] == pytest.approx(1.5)
+
+
+def test_scalper_smc_golden_fvg_multi_phase_transitions(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify Strategy 3 (SMC_GOLDEN_FVG) PHASE_1_POI_TAPPED -> PHASE_2_CHOCH -> PHASE_3_LIMIT_ARMED."""
+    db_file = str(tmp_path / "test_smc.duckdb")
+    monkeypatch.setattr(scalper_mod, "DB_PATH", db_file)
+
+    # 15m unmitigated Bullish Demand FVG: c0.high=99500 < c2.low=99700 -> [99500, 99700]
+    df_15m = pd.DataFrame(
+        {
+            "open": [99300.0, 99450.0, 99750.0],
+            "high": [99500.0, 99780.0, 99950.0],
+            "low": [99200.0, 99420.0, 99700.0],
+            "close": [99450.0, 99760.0, 99900.0],
+        }
+    )
+    # 1m Phase 1: price taps 15m FVG at 99600
+    df_1m_tap = pd.DataFrame(
+        {
+            "open": [99650.0, 99620.0, 99610.0, 99605.0, 99610.0],
+            "high": [99680.0, 99640.0, 99630.0, 99625.0, 99620.0],
+            "low": [99600.0, 99590.0, 99580.0, 99575.0, 99590.0],
+            "close": [99620.0, 99610.0, 99605.0, 99610.0, 99600.0],
+        }
+    )
+
+    st_p1 = _base_state(
+        asset_symbols=["BTC/USD"],
+        market_data_by_symbol={"BTC/USD": df_1m_tap, "BTC/USD_15M": df_15m},
+    )
+    st_p1["market_regime"] = "FLAT"
+    st_p1["current_price"] = 99600.0
+    assert scalper_expert_node(st_p1)["trade_intents"] == []
+
+    conn = duckdb.connect(db_file)
+    try:
+        row1 = conn.execute(
+            "SELECT strategy, phase, sweep_low, target_price FROM setup_state_machine LIMIT 1"
+        ).fetchone()
+        assert row1 == ("SMC_GOLDEN_FVG", "PHASE_1_POI_TAPPED", 99500.0, 99700.0)
+    finally:
+        conn.close()
+
+    # 1m Phase 2 & 3: sweep low=99500, full-body CHoCH up to disp_high=100100, leaving 1m FVG
+    # Leg: 99500 -> 100100 (span=600). Golden Zone [50%, 61.8%] = [99729.2, 99800.0]
+    # 1m FVG: bar[-3].high=99720 < bar[-1].low=99820 -> [99720, 99820] overlaps Golden Zone!
+    df_1m_choch = pd.DataFrame(
+        {
+            "open": [99620.0, 99600.0, 99540.0, 99620.0, 99850.0],
+            "high": [99680.0, 99640.0, 99720.0, 99880.0, 100100.0],
+            "low": [99580.0, 99560.0, 99500.0, 99610.0, 99820.0],
+            "close": [99600.0, 99570.0, 99620.0, 99850.0, 100050.0],
+        }
+    )
+    st_p2 = _base_state(
+        asset_symbols=["BTC/USD"],
+        market_data_by_symbol={"BTC/USD": df_1m_choch, "BTC/USD_15M": df_15m},
+    )
+    st_p2["market_regime"] = "FLAT"
+    st_p2["current_price"] = 100050.0
+    assert scalper_expert_node(st_p2)["trade_intents"] == []
+
+    conn = duckdb.connect(db_file)
+    try:
+        phase2 = conn.execute("SELECT phase FROM setup_state_machine LIMIT 1").fetchone()[0]
+        assert phase2 == "PHASE_2_CHOCH"
+    finally:
+        conn.close()
+
+    # Phase 3: arms LIMIT_BUY in Golden Zone [99729.2, 99800.0] -> entry=99764.6, raw_sl < 99500
+    res_p3 = scalper_expert_node(st_p2)
+    assert len(res_p3["trade_intents"]) == 1
+    intent = res_p3["trade_intents"][0]
+    assert intent.action == "LIMIT_BUY"
+    assert 99729.2 <= intent.target_price <= 99800.0
+    assert intent.raw_stop_loss is not None
+    assert intent.raw_stop_loss < 99500.0
+
+    risk_out = risk_manager_node(res_p3)
+    assert risk_out["risk_cleared"] is True
+    assert risk_out["order_details"]["risk_reward_ratio"] == pytest.approx(1.5)
+
+
+def test_scalper_lvn_absorption_squeeze_multi_phase(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify Strategy 4 (LVN_ABSORPTION_SQUEEZE) PHASE_1 -> PHASE_2 -> PHASE_3 MARKET_BUY."""
+    db_file = str(tmp_path / "test_lvn.duckdb")
+    monkeypatch.setattr(scalper_mod, "DB_PATH", db_file)
+
+    # Build 60 1m bars: heavy volume around 100000..100500 (POC/VAL), sparse LVN around 99100..99200
+    closes = [100200.0] * 55 + [99150.0, 100100.0, 100150.0, 100200.0, 100250.0]
+    highs = [c + 50.0 for c in closes]
+    lows = [c - 50.0 for c in closes]
+    opens = [c - 10.0 for c in closes]
+    vols = [100.0] * 55 + [10.0, 100.0, 100.0, 100.0, 100.0]
+    df_60 = pd.DataFrame(
+        {"open": opens, "high": highs, "low": lows, "close": closes, "volume": vols}
+    )
+
+    st_p1 = _base_state(
+        asset_symbols=["BTC/USD"],
+        market_data_by_symbol={"BTC/USD": df_60},
+    )
+    st_p1["market_regime"] = "FLAT"
+    st_p1["current_price"] = 100250.0
+    assert scalper_expert_node(st_p1)["trade_intents"] == []
+
+    conn = duckdb.connect(db_file)
+    try:
+        row1 = conn.execute(
+            "SELECT strategy, phase, sweep_low, target_price FROM setup_state_machine LIMIT 1"
+        ).fetchone()
+        assert row1 is not None
+        assert row1[0] == "LVN_ABSORPTION_SQUEEZE"
+        assert row1[1] == "PHASE_1_LVN_IDENTIFIED"
+        lvn_low, lvn_high = float(row1[2]), float(row1[3])
+    finally:
+        conn.close()
+
+    # Phase 2: candle drops into [lvn_low, lvn_high] with 3x volume and narrow body + lower wick
+    lvn_mid = (lvn_low + lvn_high) / 2.0
+    df_abs = df_60.copy()
+    df_abs.iloc[-1] = {
+        "open": lvn_mid + 5.0,
+        "high": lvn_mid + 15.0,
+        "low": lvn_mid - 40.0,
+        "close": lvn_mid + 4.0,
+        "volume": 350.0,
+    }
+    st_p2 = _base_state(
+        asset_symbols=["BTC/USD"],
+        market_data_by_symbol={"BTC/USD": df_abs},
+    )
+    st_p2["market_regime"] = "FLAT"
+    st_p2["current_price"] = lvn_mid + 4.0
+    assert scalper_expert_node(st_p2)["trade_intents"] == []
+
+    conn = duckdb.connect(db_file)
+    try:
+        phase2 = conn.execute("SELECT phase FROM setup_state_machine LIMIT 1").fetchone()[0]
+        assert phase2 == "PHASE_2_ABSORPTION"
+    finally:
+        conn.close()
+
+    # Phase 3: price breaks above absorption candle high (lvn_mid + 15.0) -> MARKET_BUY
+    st_p3 = _base_state(
+        asset_symbols=["BTC/USD"],
+        market_data_by_symbol={"BTC/USD": df_abs},
+    )
+    st_p3["market_regime"] = "FLAT"
+    st_p3["current_price"] = lvn_mid + 25.0
+    res_p3 = scalper_expert_node(st_p3)
+
+    assert len(res_p3["trade_intents"]) == 1
+    intent = res_p3["trade_intents"][0]
+    assert intent.action == "MARKET_BUY"
+    assert intent.raw_stop_loss == pytest.approx(lvn_mid - 40.0)
+
+    risk_out = risk_manager_node(res_p3)
+    assert risk_out["risk_cleared"] is True
+    assert risk_out["order_details"]["order_type"] == "market"
+    assert risk_out["order_details"]["extended_hours"] is False

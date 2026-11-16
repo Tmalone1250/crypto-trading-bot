@@ -8,6 +8,7 @@ from risk_node import (
     MAX_RISK_USD,
     MIN_CRYPTO_ORDER_SIZE,
     QTY_PRECISION,
+    calculate_trade_risk,
     risk_manager_node,
 )
 from state import AgentState
@@ -164,3 +165,45 @@ def test_risk_manager_node_vetoed_high_volatility() -> None:
     assert updated_state["order_details"] == {}
     assert updated_state["error_message"] is not None
     assert "Risk veto" in updated_state["error_message"]
+
+
+def test_calculate_trade_risk_long_with_house_money_pyramiding() -> None:
+    """Verify anti-slippage offset (0.9995), +25% PnL pyramiding, and 1.5R TP for longs."""
+    result = calculate_trade_risk(
+        entry_price=100000.0,
+        raw_stop_loss=99000.0,
+        session_realized_pnl=200.0,
+        is_long=True,
+    )
+
+    expected_sl = 99000.0 * 0.9995  # 98950.5
+    stop_distance = 100000.0 - expected_sl  # 1049.5
+    expected_risk = 250.0 + (0.25 * 200.0)  # 300.0
+    expected_size = round(expected_risk / stop_distance, QTY_PRECISION)
+    expected_tp = 100000.0 + (1.5 * stop_distance)
+
+    assert result["stop_loss"] == pytest.approx(expected_sl)
+    assert result["active_risk"] == pytest.approx(expected_risk)
+    assert result["position_size"] == pytest.approx(expected_size)
+    assert result["take_profit"] == pytest.approx(expected_tp)
+
+
+def test_calculate_trade_risk_short_ignores_negative_pnl() -> None:
+    """Verify anti-slippage offset (1.0005), no negative PnL penalty, and 1.5R TP for shorts."""
+    result = calculate_trade_risk(
+        entry_price=100000.0,
+        raw_stop_loss=101000.0,
+        session_realized_pnl=-150.0,
+        is_long=False,
+    )
+
+    expected_sl = 101000.0 * 1.0005  # 101050.5
+    stop_distance = expected_sl - 100000.0  # 1050.5
+    expected_risk = 250.0
+    expected_size = round(expected_risk / stop_distance, QTY_PRECISION)
+    expected_tp = 100000.0 - (1.5 * stop_distance)
+
+    assert result["stop_loss"] == pytest.approx(expected_sl)
+    assert result["active_risk"] == pytest.approx(expected_risk)
+    assert result["position_size"] == pytest.approx(expected_size)
+    assert result["take_profit"] == pytest.approx(expected_tp)

@@ -1,10 +1,19 @@
 """Unit tests for the Regime Supervisor Node (deterministic volatility gate)."""
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import duckdb
 import pandas as pd
 import pytest
 
 from state import AgentState
-from supervisor_node import FLAT_RATIONALE, supervisor_node
+import supervisor_node as supervisor_mod
+from supervisor_node import (
+    FLAT_RATIONALE,
+    THREE_LOSS_RATIONALE,
+    detect_session_open,
+    supervisor_node,
+)
 
 
 REQUIRED_STATE_KEYS = {
@@ -164,3 +173,54 @@ def test_supervisor_node_gates_active_on_0_20_percent_move_from_last_alpha_eval(
     state_large_move["current_price"] = 90200.0
     res_large = supervisor_node(state_large_move)
     assert res_large["market_regime"] == "ACTIVE"
+
+
+def test_detect_session_open_ny_london_asia() -> None:
+    """Verify session open detector catches NY (08:30 CST), London, and Asia opens."""
+    ny_open = datetime(2026, 11, 16, 8, 30, tzinfo=ZoneInfo("America/Chicago"))
+    london_open = datetime(2026, 11, 16, 8, 0, tzinfo=ZoneInfo("Europe/London"))
+    asia_open = datetime(2026, 11, 16, 9, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+    non_open = datetime(2026, 11, 16, 11, 15, tzinfo=ZoneInfo("America/Chicago"))
+
+    assert detect_session_open(ny_open) == "NEW_YORK"
+    assert detect_session_open(london_open) == "LONDON"
+    assert detect_session_open(asia_open) == "ASIA"
+    assert detect_session_open(non_open) is None
+
+
+def test_supervisor_anchors_fair_price_and_enforces_three_loss_rule(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify NY open anchors Fair Price in DuckDB and Three-Loss Rule aborts to FLAT."""
+    db_file = str(tmp_path / "test_supervisor.duckdb")
+    monkeypatch.setattr(supervisor_mod, "DB_PATH", db_file)
+
+    ny_open = datetime(2026, 11, 16, 8, 30, tzinfo=ZoneInfo("America/Chicago"))
+    df = pd.DataFrame(
+        {"high": [91200.0], "low": [91000.0], "close": [91150.0]}
+    )
+    state = _make_state(df)
+    state["current_price"] = 91150.0
+
+    updated = supervisor_node(state, now=ny_open)
+    assert updated["market_regime"] == "SESSION_OPEN_WATCH"
+
+    conn = duckdb.connect(db_file)
+    try:
+        row = conn.execute(
+            "SELECT strategy, phase, target_price FROM setup_state_machine LIMIT 1"
+        ).fetchone()
+        assert row == ("FAIR_PRICE_REVERSION", "PHASE_0_ANCHORED", 91150.0)
+
+        # Now insert consecutive_losses = 3 for today and verify Three-Loss Rule aborts.
+        conn.execute(
+            "INSERT INTO session_metrics (date, realized_pnl, consecutive_losses) VALUES (?, ?, ?)",
+            [ny_open.date(), -450.0, 3],
+        )
+    finally:
+        conn.close()
+
+    aborted = supervisor_node(state, now=ny_open)
+    assert aborted["market_regime"] == "FLAT"
+    assert aborted["action"] == "HOLD"
+    assert aborted["rationale"] == THREE_LOSS_RATIONALE

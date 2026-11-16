@@ -20,6 +20,61 @@ ATR_STOP_MULTIPLIER: float = 1.5
 RISK_REWARD_RATIO: float = 2.0
 DEFAULT_ORDER_TYPE: str = "limit"
 DEFAULT_TIME_IN_FORCE: str = "gtc"
+BASE_ACTIVE_RISK_USD: float = 250.00
+HOUSE_MONEY_PYRAMID_PCT: float = 0.25
+LONG_SLIPPAGE_OFFSET: float = 0.9995
+SHORT_SLIPPAGE_OFFSET: float = 1.0005
+STRICT_TP_R_MULTIPLE: float = 1.5
+
+
+def calculate_trade_risk(
+    entry_price: float,
+    raw_stop_loss: float,
+    session_realized_pnl: float,
+    is_long: bool,
+) -> dict[str, float]:
+    """Compute anti-slippage SL, house-money pyramided risk, size, and 1.5R TP.
+
+    Args:
+        entry_price: Planned trade entry price.
+        raw_stop_loss: Unadjusted structural stop-loss price.
+        session_realized_pnl: Current session realized PnL in USD.
+        is_long: ``True`` for long positions, ``False`` for short positions.
+
+    Returns:
+        Dictionary containing ``position_size``, ``stop_loss``, ``take_profit``,
+        and ``active_risk``.
+    """
+    entry = float(entry_price)
+    raw_sl = float(raw_stop_loss)
+    pnl = float(session_realized_pnl)
+
+    if entry <= 0.0 or raw_sl <= 0.0:
+        raise ValueError("entry_price and raw_stop_loss must be positive.")
+
+    offset_sl = raw_sl * (LONG_SLIPPAGE_OFFSET if is_long else SHORT_SLIPPAGE_OFFSET)
+    stop_distance = (entry - offset_sl) if is_long else (offset_sl - entry)
+    if stop_distance <= 0.0:
+        raise ValueError(
+            "Invalid stop loss placement relative to entry_price after anti-slippage offset."
+        )
+
+    pyramiding_bonus = HOUSE_MONEY_PYRAMID_PCT * pnl if pnl > 0.0 else 0.0
+    active_risk = BASE_ACTIVE_RISK_USD + pyramiding_bonus
+    position_size = active_risk / stop_distance
+
+    take_profit = (
+        entry + (STRICT_TP_R_MULTIPLE * stop_distance)
+        if is_long
+        else entry - (STRICT_TP_R_MULTIPLE * stop_distance)
+    )
+
+    return {
+        "position_size": float(round(position_size, QTY_PRECISION)),
+        "stop_loss": float(round(offset_sl, 6)),
+        "take_profit": float(round(take_profit, 6)),
+        "active_risk": float(round(active_risk, 4)),
+    }
 
 
 def _is_dry_run() -> bool:
@@ -48,6 +103,48 @@ def risk_manager_node(state: AgentState) -> AgentState:
     action = str(state.get("action", "LIMIT_BUY")).upper()
 
     if state.get("trade_intents"):
+        intents = state["trade_intents"]
+        primary = intents[0]
+        if getattr(primary, "raw_stop_loss", None) is not None:
+            action_upper = str(primary.action).upper()
+            is_long = action_upper in {"LIMIT_BUY", "MARKET_BUY"}
+            order_type = "market" if action_upper.startswith("MARKET_") else DEFAULT_ORDER_TYPE
+            risk_calc = calculate_trade_risk(
+                entry_price=float(primary.target_price),
+                raw_stop_loss=float(primary.raw_stop_loss),
+                session_realized_pnl=float(state.get("realized_pnl", 0.0)),
+                is_long=is_long,
+            )
+            updated_primary = primary.model_copy(
+                update={
+                    "qty": risk_calc["position_size"],
+                    "notional_usd": round(
+                        risk_calc["position_size"] * float(primary.target_price), 2
+                    ),
+                }
+            )
+            updated_intents = [updated_primary, *intents[1:]]
+            return {
+                **state,
+                "trade_intents": updated_intents,
+                "risk_cleared": True,
+                "order_details": {
+                    "symbol": primary.symbol,
+                    "side": "buy" if is_long else "sell",
+                    "order_type": order_type,
+                    "time_in_force": DEFAULT_TIME_IN_FORCE,
+                    "extended_hours": False,
+                    "limit_price": None if order_type == "market" else float(primary.target_price),
+                    "entry_price": float(primary.target_price),
+                    "stop_loss_price": risk_calc["stop_loss"],
+                    "target_price": risk_calc["take_profit"],
+                    "position_size": risk_calc["position_size"],
+                    "projected_dollar_risk": risk_calc["active_risk"],
+                    "risk_reward_ratio": STRICT_TP_R_MULTIPLE,
+                    "dry_run": _is_dry_run(),
+                },
+                "error_message": None,
+            }
         return {
             **state,
             "risk_cleared": True,

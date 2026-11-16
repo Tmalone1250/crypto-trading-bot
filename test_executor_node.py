@@ -11,6 +11,7 @@ from executor_node import (
     CANCEL_ALL_TOOL_NAME,
     cancel_all_orders,
     execution_node,
+    monitor_trade_and_breakeven,
     place_crypto_order,
 )
 from state import AgentState, TradeIntent
@@ -432,3 +433,85 @@ def test_place_crypto_order_calls_mcp_with_string_casts_and_validates_tif() -> N
 
     with pytest.raises(ValueError, match="Unsupported crypto order_type"):
         place_crypto_order({**order_details, "order_type": "bracket"})
+
+
+def test_monitor_trade_and_breakeven_triggers_replace_order_at_momentum_threshold() -> None:
+    """Verify 1s polling moves stop-loss to entry_price via replace_order at +0.15% PnL."""
+    mock_client = MagicMock()
+    # Sequential prices: exact entry, slight drawdown, then > +0.0015 momentum threshold
+    mock_client.get_latest_trade.side_effect = [
+        SimpleNamespace(price=100000.0),
+        SimpleNamespace(price=99900.0),
+        SimpleNamespace(price=100200.0),
+    ]
+    mock_client.replace_order.return_value = {"id": "ord-sl-123", "stop_price": "100000.0"}
+
+    with patch("executor_node.time.sleep") as mock_sleep:
+        result = monitor_trade_and_breakeven(
+            client=mock_client,
+            order_id="ord-sl-123",
+            entry_price=100000.0,
+            is_long=True,
+        )
+
+    assert result["breakeven_triggered"] is True
+    assert result["order_id"] == "ord-sl-123"
+    assert result["entry_price"] == pytest.approx(100000.0)
+    assert result["trigger_price"] == pytest.approx(100200.0)
+    assert mock_client.get_latest_trade.call_count == 3
+    assert mock_sleep.call_count == 2
+    mock_client.replace_order.assert_called_once_with(
+        order_id="ord-sl-123",
+        stop_price="100000.0",
+    )
+
+
+def test_monitor_trade_and_breakeven_exits_after_max_attempts() -> None:
+    """Verify polling stops cleanly after max_attempts when threshold is never reached."""
+    mock_client = MagicMock()
+    mock_client.get_latest_trade.return_value = SimpleNamespace(price=100000.0)
+
+    with patch("executor_node.time.sleep") as mock_sleep:
+        result = monitor_trade_and_breakeven(
+            client=mock_client,
+            order_id="ord-sl-timeout",
+            entry_price=100000.0,
+            is_long=True,
+            max_attempts=3,
+        )
+
+    assert result["breakeven_triggered"] is False
+    assert result["attempts"] == 3
+    assert mock_client.get_latest_trade.call_count == 3
+    assert mock_sleep.call_count == 2
+    mock_client.replace_order.assert_not_called()
+
+
+def test_alpaca_paper_config_and_market_intent_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify config.py pins Paper Trading URL/keys and executor passes TIF/extended_hours."""
+    from config import ALPACA_PAPER_URL, get_alpaca_paper_config
+    from executor_node import _intent_to_order_details
+
+    monkeypatch.setenv("APCA_API_KEY_ID", "paper-key-id")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "paper-secret-key")
+    cfg = get_alpaca_paper_config()
+
+    assert cfg["base_url"] == ALPACA_PAPER_URL
+    assert cfg["api_key"] == "paper-key-id"
+    assert cfg["secret_key"] == "paper-secret-key"
+    assert cfg["paper"] is True
+
+    intent = TradeIntent(
+        symbol="BTC/USD",
+        action="MARKET_BUY",
+        target_price=100000.0,
+        qty=0.002,
+        notional_usd=200.0,
+        raw_stop_loss=99500.0,
+        rationale="LVN squeeze market buy",
+    )
+    _, act, _, details = _intent_to_order_details(intent)
+    assert act == "MARKET_BUY"
+    assert details["type"] == "market"
+    assert details["time_in_force"] == "gtc"
+    assert details["extended_hours"] is False

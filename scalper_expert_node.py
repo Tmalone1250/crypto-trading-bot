@@ -13,11 +13,20 @@ Operates without LLM calls when ``Supervisor`` classifies the market as ``FLAT``
     ``TradeIntent`` objects (never market orders).
 """
 
+from datetime import datetime, timezone
 from typing import Any
+import uuid
+import duckdb
 import pandas as pd
 
 from state import AgentState, TradeIntent
 
+DB_PATH: str = "agent_trades.duckdb"
+FAIR_PRICE_STRATEGY: str = "FAIR_PRICE_REVERSION"
+CRT_REBREAK_STRATEGY: str = "CRT_REBREAK"
+SMC_GOLDEN_FVG_STRATEGY: str = "SMC_GOLDEN_FVG"
+LVN_ABSORPTION_STRATEGY: str = "LVN_ABSORPTION_SQUEEZE"
+DISPLACEMENT_THRESHOLD_PCT: float = 0.0020  # 0.20% minimum deviation from Fair Price anchor
 DEFAULT_SCALP_SYMBOLS: tuple[str, ...] = ("BTC/USD", "ETH/USD", "SOL/USD")
 FEE_ADJUSTED_PROFIT_MULTIPLIER: float = 1.015  # +1.5% gross target to clear 0.30% maker fees
 TRANCHE_GRID_DROP_MULTIPLIER: float = 0.98     # -2.0% below avg_entry_price for next tranche
@@ -141,8 +150,816 @@ def _evaluate_symbol_intent(
     return None
 
 
+def _evaluate_session_open_reversion(state: AgentState) -> AgentState:
+    """Execute J.J. Simon Fair Price Reversion Phase 1/2 state machine in ``SESSION_OPEN_WATCH``."""
+    symbol = state.get("asset_symbol", "BTC/USD")
+    df = _get_symbol_dataframe(state, symbol)
+    if df is None or df.empty or not {"open", "high", "low", "close"}.issubset(df.columns):
+        return {
+            **state,
+            "trade_intents": [],
+            "action": "HOLD",
+            "target_price": None,
+            "rationale": "Session Open Watch: waiting for valid 1m OHLCV candles.",
+        }
+
+    current_price = float(state.get("current_price", 0.0))
+    if current_price <= 0.0:
+        current_price = float(df["close"].iloc[-1])
+
+    conn = duckdb.connect(DB_PATH)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS setup_state_machine (
+                setup_id VARCHAR PRIMARY KEY,
+                strategy VARCHAR NOT NULL,
+                phase VARCHAR NOT NULL,
+                sweep_low DOUBLE,
+                target_price DOUBLE,
+                timestamp TIMESTAMP NOT NULL
+            )
+            """
+        )
+        row = conn.execute(
+            """
+            SELECT setup_id, phase, target_price
+            FROM setup_state_machine
+            WHERE strategy = ?
+              AND phase IN ('PHASE_0_ANCHORED', 'PHASE_1_DISPLACED')
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            [FAIR_PRICE_STRATEGY],
+        ).fetchone()
+
+        if row is None or row[2] is None:
+            return {
+                **state,
+                "trade_intents": [],
+                "action": "HOLD",
+                "target_price": None,
+                "rationale": "Session Open Watch: no active Fair Price anchor in DuckDB.",
+            }
+
+        setup_id, phase, fair_price = str(row[0]), str(row[1]), float(row[2])
+        if fair_price <= 0.0:
+            return {
+                **state,
+                "trade_intents": [],
+                "action": "HOLD",
+                "target_price": None,
+                "rationale": "Session Open Watch: invalid Fair Price anchor.",
+            }
+
+        if phase == "PHASE_0_ANCHORED":
+            displacement_pct = abs(current_price - fair_price) / fair_price
+            if displacement_pct >= DISPLACEMENT_THRESHOLD_PCT:
+                sweep_extreme = (
+                    float(df.tail(5)["low"].min())
+                    if current_price < fair_price
+                    else float(df.tail(5)["high"].max())
+                )
+                conn.execute(
+                    """
+                    UPDATE setup_state_machine
+                    SET phase = 'PHASE_1_DISPLACED', sweep_low = ?
+                    WHERE setup_id = ?
+                    """,
+                    [sweep_extreme, setup_id],
+                )
+                print(
+                    f"[Scalper] {setup_id} Phase 1 Displaced: price ${current_price:.2f} "
+                    f"deviated {displacement_pct:.3%} from Fair Price ${fair_price:.2f}"
+                )
+                return {
+                    **state,
+                    "trade_intents": [],
+                    "action": "HOLD",
+                    "target_price": None,
+                    "rationale": (
+                        f"Phase 1 Displaced ({displacement_pct:.2%} from Fair Price "
+                        f"${fair_price:.2f}); monitoring for structure break."
+                    ),
+                }
+
+            return {
+                **state,
+                "trade_intents": [],
+                "action": "HOLD",
+                "target_price": None,
+                "rationale": (
+                    f"Phase 0 Anchored at ${fair_price:.2f}; displacement "
+                    f"{displacement_pct:.3%} (< 0.20%)."
+                ),
+            }
+
+        if phase == "PHASE_1_DISPLACED" and len(df) >= 2:
+            prev = df.iloc[-2]
+            curr = df.iloc[-1]
+            prev_body = abs(float(prev["close"]) - float(prev["open"]))
+            curr_body = abs(float(curr["close"]) - float(curr["open"]))
+            curr_open = float(curr["open"])
+            curr_close = float(curr["close"])
+            prev_high = float(prev["high"])
+            prev_low = float(prev["low"])
+
+            triggered_action: str | None = None
+            raw_sl: float | None = None
+
+            if curr_body > prev_body:
+                if curr_close < fair_price and curr_close > curr_open and curr_close > prev_high:
+                    triggered_action = "LIMIT_BUY"
+                    raw_sl = float(df.tail(5)["low"].min())
+                elif curr_close > fair_price and curr_close < curr_open and curr_close < prev_low:
+                    triggered_action = "LIMIT_SELL"
+                    raw_sl = float(df.tail(5)["high"].max())
+
+            if triggered_action is not None and raw_sl is not None:
+                conn.execute(
+                    """
+                    UPDATE setup_state_machine
+                    SET phase = 'PHASE_2_TRIGGERED'
+                    WHERE setup_id = ?
+                    """,
+                    [setup_id],
+                )
+                entry_price = curr_close
+                rationale = (
+                    f"Fair Price Reversion {triggered_action} on {symbol} ({setup_id}): "
+                    f"1m displacement candle broke structure toward ${fair_price:.2f} "
+                    f"(entry=${entry_price:.2f}, raw_sl=${raw_sl:.2f})."
+                )
+                intent = TradeIntent(
+                    symbol=symbol,
+                    action=triggered_action,  # type: ignore[arg-type]
+                    target_price=entry_price,
+                    qty=round(TRANCHE_NOTIONAL_USD / entry_price, QTY_PRECISION),
+                    notional_usd=TRANCHE_NOTIONAL_USD,
+                    raw_stop_loss=raw_sl,
+                    rationale=rationale,
+                )
+                print(f"[Scalper] {rationale}")
+                return {
+                    **state,
+                    "trade_intents": [intent],
+                    "action": intent.action,
+                    "target_price": intent.target_price,
+                    "rationale": intent.rationale,
+                }
+    finally:
+        conn.close()
+
+    return {
+        **state,
+        "trade_intents": [],
+        "action": "HOLD",
+        "target_price": None,
+        "rationale": "Session Open Watch: awaiting Phase 2 reversion candle.",
+    }
+
+
+def _get_htf_1h_dataframe(
+    state: AgentState,
+    symbol: str,
+    df_exec: pd.DataFrame | None,
+) -> pd.DataFrame | None:
+    """Resolve 1-Hour OHLCV candles from ``market_data_by_symbol`` or resample ``df_exec``."""
+    market_map = state.get("market_data_by_symbol") or {}
+    for key in (f"{symbol}_1H", f"{symbol}:1H", "1H"):
+        htf = market_map.get(key)
+        if htf is not None and not htf.empty:
+            return htf
+
+    if df_exec is None or df_exec.empty:
+        return None
+
+    work_df = df_exec
+    if not isinstance(work_df.index, pd.DatetimeIndex):
+        if "timestamp" in work_df.columns:
+            work_df = work_df.set_index(pd.to_datetime(work_df["timestamp"]))
+        else:
+            return None
+
+    if not {"high", "low", "close"}.issubset(work_df.columns):
+        return None
+
+    agg_spec: dict[str, str] = {"high": "max", "low": "min", "close": "last"}
+    if "open" in work_df.columns:
+        agg_spec["open"] = "first"
+
+    resampled = work_df.resample("1h").agg(agg_spec).dropna(subset=["high", "low", "close"])
+    return resampled if len(resampled) >= 2 else None
+
+
+def _evaluate_crt_rebreak(state: AgentState) -> TradeIntent | None:
+    """Execute the 24/7 CRT Re-break 4-phase state machine via DuckDB ``setup_state_machine``."""
+    symbol = state.get("asset_symbol", "BTC/USD")
+    df_exec = _get_symbol_dataframe(state, symbol)
+    current_price = float(state.get("current_price", 0.0))
+    if current_price <= 0.0 and df_exec is not None and not df_exec.empty and "close" in df_exec.columns:
+        current_price = float(df_exec["close"].iloc[-1])
+
+    if current_price <= 0.0:
+        return None
+
+    conn = duckdb.connect(DB_PATH)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS setup_state_machine (
+                setup_id VARCHAR PRIMARY KEY,
+                strategy VARCHAR NOT NULL,
+                phase VARCHAR NOT NULL,
+                sweep_low DOUBLE,
+                target_price DOUBLE,
+                timestamp TIMESTAMP NOT NULL
+            )
+            """
+        )
+
+        row = conn.execute(
+            """
+            SELECT setup_id, phase, sweep_low, target_price
+            FROM setup_state_machine
+            WHERE strategy = ?
+              AND phase IN ('PHASE_1_SWEPT', 'PHASE_2_FIRST_BREAK', 'PHASE_3_PULLBACK')
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            [CRT_REBREAK_STRATEGY],
+        ).fetchone()
+
+        # Phase 0 & Phase 1: Monitor 1H candles when no CRT setup is active.
+        if row is None:
+            df_1h = _get_htf_1h_dataframe(state, symbol, df_exec)
+            if df_1h is None or len(df_1h) < 2 or not {"high", "low", "close"}.issubset(df_1h.columns):
+                return None
+
+            candle_1 = df_1h.iloc[-2]
+            candle_2 = df_1h.iloc[-1]
+            h1, l1 = float(candle_1["high"]), float(candle_1["low"])
+            h2, l2, c2_close = float(candle_2["high"]), float(candle_2["low"]), float(candle_2["close"])
+
+            direction: str | None = None
+            target_extreme: float | None = None
+
+            # Swept L1 and reversed back inside Candle 1 range -> LONG targeting H1
+            if l2 < l1 and l1 < c2_close < h1:
+                direction = "LONG"
+                target_extreme = h1
+            # Swept H1 and reversed back inside Candle 1 range -> SHORT targeting L1
+            elif h2 > h1 and l1 < c2_close < h1:
+                direction = "SHORT"
+                target_extreme = l1
+
+            if direction is None or target_extreme is None:
+                return None
+
+            midpoint = (h2 + l2) / 2.0
+            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+            setup_id = f"CRT-{direction}-{now_naive.strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+            conn.execute(
+                """
+                INSERT INTO setup_state_machine (
+                    setup_id,
+                    strategy,
+                    phase,
+                    sweep_low,
+                    target_price,
+                    timestamp
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [setup_id, CRT_REBREAK_STRATEGY, "PHASE_1_SWEPT", midpoint, target_extreme, now_naive],
+            )
+            print(
+                f"[Scalper] CRT Phase 1 Swept ({setup_id}): M={midpoint:.2f}, "
+                f"Target={target_extreme:.2f}"
+            )
+            return None
+
+        setup_id, phase = str(row[0]), str(row[1])
+        if row[2] is None or row[3] is None:
+            return None
+        midpoint, target_extreme = float(row[2]), float(row[3])
+        is_long = setup_id.startswith("CRT-LONG") or target_extreme > midpoint
+
+        # Phase 2 (First Break): Price crosses M in trade direction (no entry yet).
+        if phase == "PHASE_1_SWEPT":
+            crossed_first = current_price > midpoint if is_long else current_price < midpoint
+            if crossed_first:
+                conn.execute(
+                    "UPDATE setup_state_machine SET phase = 'PHASE_2_FIRST_BREAK' WHERE setup_id = ?",
+                    [setup_id],
+                )
+                print(f"[Scalper] CRT {setup_id} -> PHASE_2_FIRST_BREAK @ ${current_price:.2f}")
+            return None
+
+        # Phase 3 (Pullback): Price pulls back across M against trade direction.
+        if phase == "PHASE_2_FIRST_BREAK":
+            pulled_back = current_price < midpoint if is_long else current_price > midpoint
+            if pulled_back:
+                conn.execute(
+                    "UPDATE setup_state_machine SET phase = 'PHASE_3_PULLBACK' WHERE setup_id = ?",
+                    [setup_id],
+                )
+                print(f"[Scalper] CRT {setup_id} -> PHASE_3_PULLBACK @ ${current_price:.2f}")
+            return None
+
+        # Phase 4 (Re-break Execution): Price crosses M again in trade direction -> emit TradeIntent.
+        if phase == "PHASE_3_PULLBACK":
+            rebreak = current_price >= midpoint if is_long else current_price <= midpoint
+            if not rebreak:
+                return None
+
+            target_distance = abs(target_extreme - midpoint)
+            if target_distance <= 0.0:
+                return None
+
+            sl_distance = target_distance / 1.5
+            raw_stop_loss = (midpoint - sl_distance) if is_long else (midpoint + sl_distance)
+            if raw_stop_loss <= 0.0:
+                return None
+
+            conn.execute(
+                "UPDATE setup_state_machine SET phase = 'PHASE_4_EXECUTED' WHERE setup_id = ?",
+                [setup_id],
+            )
+            action = "LIMIT_BUY" if is_long else "LIMIT_SELL"
+            rationale = (
+                f"CRT Re-break Phase 4 {action} on {symbol} ({setup_id}): "
+                f"entry at M=${midpoint:.2f}, target=${target_extreme:.2f}, "
+                f"raw_sl=${raw_stop_loss:.2f} (1.5R)."
+            )
+            print(f"[Scalper] {rationale}")
+            return TradeIntent(
+                symbol=symbol,
+                action=action,  # type: ignore[arg-type]
+                target_price=round(midpoint, 6),
+                qty=round(TRANCHE_NOTIONAL_USD / midpoint, QTY_PRECISION),
+                notional_usd=TRANCHE_NOTIONAL_USD,
+                raw_stop_loss=round(raw_stop_loss, 6),
+                rationale=rationale,
+            )
+    finally:
+        conn.close()
+
+    return None
+
+
+def _ensure_setup_table(conn: duckdb.DuckDBPyConnection) -> None:
+    """Ensure ``setup_state_machine`` exists in DuckDB."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS setup_state_machine (
+            setup_id VARCHAR PRIMARY KEY,
+            strategy VARCHAR NOT NULL,
+            phase VARCHAR NOT NULL,
+            sweep_low DOUBLE,
+            target_price DOUBLE,
+            timestamp TIMESTAMP NOT NULL
+        )
+        """
+    )
+
+
+def _get_mtf_15m_dataframe(
+    state: AgentState,
+    symbol: str,
+    df_exec: pd.DataFrame | None,
+) -> pd.DataFrame | None:
+    """Resolve 15-minute OHLCV candles from ``market_data_by_symbol`` or resample ``df_exec``."""
+    market_map = state.get("market_data_by_symbol") or {}
+    for key in (f"{symbol}_15M", f"{symbol}:15M", "15M"):
+        mtf = market_map.get(key)
+        if mtf is not None and not mtf.empty:
+            return mtf
+
+    if df_exec is None or df_exec.empty:
+        return None
+
+    work_df = df_exec
+    if not isinstance(work_df.index, pd.DatetimeIndex):
+        if "timestamp" in work_df.columns:
+            work_df = work_df.set_index(pd.to_datetime(work_df["timestamp"]))
+        else:
+            return None
+
+    if not {"high", "low", "close"}.issubset(work_df.columns):
+        return None
+
+    agg_spec: dict[str, str] = {"high": "max", "low": "min", "close": "last"}
+    if "open" in work_df.columns:
+        agg_spec["open"] = "first"
+
+    resampled = work_df.resample("15min").agg(agg_spec).dropna(subset=["high", "low", "close"])
+    return resampled if len(resampled) >= 3 else None
+
+
+def _find_tapped_15m_fvg(
+    df_15m: pd.DataFrame,
+    current_price: float,
+) -> tuple[str, float, float] | None:
+    """Locate an unmitigated 15m FVG currently tapped by ``current_price``."""
+    if len(df_15m) < 3 or not {"high", "low", "close"}.issubset(df_15m.columns):
+        return None
+
+    for idx in range(len(df_15m) - 1, 1, -1):
+        c0 = df_15m.iloc[idx - 2]
+        c2 = df_15m.iloc[idx]
+        c0_high, c0_low = float(c0["high"]), float(c0["low"])
+        c2_high, c2_low = float(c2["high"]), float(c2["low"])
+
+        # Bullish Demand FVG: c0.high < c2.low
+        if c0_high < c2_low:
+            fvg_low, fvg_high = c0_high, c2_low
+            subsequent = df_15m.iloc[idx + 1 :]
+            mitigated = not subsequent.empty and (subsequent["close"] < fvg_low).any()
+            if not mitigated and fvg_low <= current_price <= fvg_high:
+                return ("LONG", fvg_low, fvg_high)
+
+        # Bearish Supply FVG: c0.low > c2.high
+        if c0_low > c2_high:
+            fvg_low, fvg_high = c2_high, c0_low
+            subsequent = df_15m.iloc[idx + 1 :]
+            mitigated = not subsequent.empty and (subsequent["close"] > fvg_high).any()
+            if not mitigated and fvg_low <= current_price <= fvg_high:
+                return ("SHORT", fvg_low, fvg_high)
+
+    return None
+
+
+def _find_latest_1m_fvg(df_1m: pd.DataFrame, is_long: bool) -> tuple[float, float] | None:
+    """Return ``(fvg_low, fvg_high)`` of the most recent 1m FVG matching direction."""
+    if len(df_1m) < 3:
+        return None
+    for idx in range(len(df_1m) - 1, 1, -1):
+        c0_high = float(df_1m.iloc[idx - 2]["high"])
+        c0_low = float(df_1m.iloc[idx - 2]["low"])
+        c2_high = float(df_1m.iloc[idx]["high"])
+        c2_low = float(df_1m.iloc[idx]["low"])
+        if is_long and c0_high < c2_low:
+            return (c0_high, c2_low)
+        if not is_long and c0_low > c2_high:
+            return (c2_high, c0_low)
+    return None
+
+
+def _evaluate_smc_golden_fvg(state: AgentState) -> TradeIntent | None:
+    """Strategy 3: MTF Market Shift + Golden Zone (50%-61.8%) FVG Limit Entry."""
+    symbol = state.get("asset_symbol", "BTC/USD")
+    df_exec = _get_symbol_dataframe(state, symbol)
+    current_price = float(state.get("current_price", 0.0))
+    if current_price <= 0.0 and df_exec is not None and not df_exec.empty and "close" in df_exec.columns:
+        current_price = float(df_exec["close"].iloc[-1])
+
+    if current_price <= 0.0:
+        return None
+
+    conn = duckdb.connect(DB_PATH)
+    try:
+        _ensure_setup_table(conn)
+        row = conn.execute(
+            """
+            SELECT setup_id, phase, sweep_low, target_price
+            FROM setup_state_machine
+            WHERE strategy = ?
+              AND phase IN ('PHASE_1_POI_TAPPED', 'PHASE_2_CHOCH')
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            [SMC_GOLDEN_FVG_STRATEGY],
+        ).fetchone()
+
+        # Phase 1 (PHASE_1_POI_TAPPED): 15m FVG tap detection
+        if row is None:
+            df_15m = _get_mtf_15m_dataframe(state, symbol, df_exec)
+            if df_15m is None:
+                return None
+            tapped = _find_tapped_15m_fvg(df_15m, current_price)
+            if tapped is None:
+                return None
+
+            direction, fvg_low, fvg_high = tapped
+            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+            setup_id = f"SMC-{direction}-{now_naive.strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+            conn.execute(
+                """
+                INSERT INTO setup_state_machine (
+                    setup_id, strategy, phase, sweep_low, target_price, timestamp
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [setup_id, SMC_GOLDEN_FVG_STRATEGY, "PHASE_1_POI_TAPPED", fvg_low, fvg_high, now_naive],
+            )
+            print(
+                f"[Scalper] SMC Phase 1 POI Tapped ({setup_id}): "
+                f"15m FVG [{fvg_low:.2f}, {fvg_high:.2f}]"
+            )
+            return None
+
+        if df_exec is None or len(df_exec) < 5 or not {"open", "high", "low", "close"}.issubset(df_exec.columns):
+            return None
+
+        setup_id, phase = str(row[0]), str(row[1])
+        is_long = setup_id.startswith("SMC-LONG")
+
+        # Phase 2 (PHASE_2_CHOCH): 1m liquidity sweep + full-body CHoCH + new 1m FVG
+        if phase == "PHASE_1_POI_TAPPED":
+            prior_bars = df_exec.iloc[:-1]
+            curr = df_exec.iloc[-1]
+            curr_open, curr_close = float(curr["open"]), float(curr["close"])
+            fvg_1m = _find_latest_1m_fvg(df_exec, is_long=is_long)
+            if fvg_1m is None:
+                return None
+
+            if is_long:
+                prior_swing_high = float(prior_bars.iloc[:-1]["high"].max()) if len(prior_bars) > 1 else float(prior_bars["high"].max())
+                prior_swing_low = float(prior_bars.iloc[:-1]["low"].min()) if len(prior_bars) > 1 else float(prior_bars["low"].min())
+                sweep_extreme = float(df_exec["low"].min())
+                swept = sweep_extreme <= prior_swing_low
+                choch = curr_close > curr_open and curr_close > prior_swing_high
+                disp_extreme = float(df_exec["high"].max())
+            else:
+                prior_swing_low = float(prior_bars.iloc[:-1]["low"].min()) if len(prior_bars) > 1 else float(prior_bars["low"].min())
+                prior_swing_high = float(prior_bars.iloc[:-1]["high"].max()) if len(prior_bars) > 1 else float(prior_bars["high"].max())
+                sweep_extreme = float(df_exec["high"].max())
+                swept = sweep_extreme >= prior_swing_high
+                choch = curr_close < curr_open and curr_close < prior_swing_low
+                disp_extreme = float(df_exec["low"].min())
+
+            if swept and choch:
+                conn.execute(
+                    """
+                    UPDATE setup_state_machine
+                    SET phase = 'PHASE_2_CHOCH', sweep_low = ?, target_price = ?
+                    WHERE setup_id = ?
+                    """,
+                    [sweep_extreme, disp_extreme, setup_id],
+                )
+                print(
+                    f"[Scalper] SMC Phase 2 CHoCH ({setup_id}): "
+                    f"sweep={sweep_extreme:.2f}, disp={disp_extreme:.2f}"
+                )
+            return None
+
+        # Phase 3 (PHASE_3_LIMIT_ARMED): 50%-61.8% Golden Zone aligned with 1m FVG
+        if phase == "PHASE_2_CHOCH":
+            if row[2] is None or row[3] is None:
+                return None
+            sweep_extreme, disp_extreme = float(row[2]), float(row[3])
+            fvg_1m = _find_latest_1m_fvg(df_exec, is_long=is_long)
+            if fvg_1m is None:
+                return None
+            fvg_low, fvg_high = fvg_1m
+
+            leg_span = abs(disp_extreme - sweep_extreme)
+            if leg_span <= 0.0:
+                return None
+
+            if is_long:
+                fib_50 = disp_extreme - (0.50 * leg_span)
+                fib_618 = disp_extreme - (0.618 * leg_span)
+                gz_low, gz_high = min(fib_50, fib_618), max(fib_50, fib_618)
+                raw_sl = sweep_extreme * 0.9999
+                action = "LIMIT_BUY"
+            else:
+                fib_50 = disp_extreme + (0.50 * leg_span)
+                fib_618 = disp_extreme + (0.618 * leg_span)
+                gz_low, gz_high = min(fib_50, fib_618), max(fib_50, fib_618)
+                raw_sl = sweep_extreme * 1.0001
+                action = "LIMIT_SELL"
+
+            overlap_low = max(gz_low, fvg_low)
+            overlap_high = min(gz_high, fvg_high)
+            if overlap_low > overlap_high:
+                return None
+
+            entry_price = (overlap_low + overlap_high) / 2.0
+            conn.execute(
+                "UPDATE setup_state_machine SET phase = 'PHASE_3_LIMIT_ARMED' WHERE setup_id = ?",
+                [setup_id],
+            )
+            rationale = (
+                f"SMC Golden FVG {action} on {symbol} ({setup_id}): "
+                f"Golden Zone [{gz_low:.2f}, {gz_high:.2f}] aligned with 1m FVG "
+                f"[{fvg_low:.2f}, {fvg_high:.2f}] -> entry=${entry_price:.2f}, raw_sl=${raw_sl:.2f}."
+            )
+            print(f"[Scalper] {rationale}")
+            return TradeIntent(
+                symbol=symbol,
+                action=action,  # type: ignore[arg-type]
+                target_price=round(entry_price, 6),
+                qty=round(TRANCHE_NOTIONAL_USD / entry_price, QTY_PRECISION),
+                notional_usd=TRANCHE_NOTIONAL_USD,
+                raw_stop_loss=round(raw_sl, 6),
+                rationale=rationale,
+            )
+    finally:
+        conn.close()
+
+    return None
+
+
+def _compute_rolling_val_and_lvn(
+    df_1m: pd.DataFrame,
+    bins: int = 12,
+) -> tuple[float, float] | None:
+    """Compute 60-bar rolling Volume Profile and return ``(lvn_low, lvn_high)`` coinciding with VAL."""
+    if df_1m is None or len(df_1m) < 60 or not {"high", "low", "close", "volume"}.issubset(df_1m.columns):
+        return None
+
+    window = df_1m.tail(60)
+    price_min = float(window["low"].min())
+    price_max = float(window["high"].max())
+    if price_max <= price_min:
+        return None
+
+    bin_width = (price_max - price_min) / bins
+    vol_by_bin = [0.0] * bins
+    for _, bar in window.iterrows():
+        typical = (float(bar["high"]) + float(bar["low"]) + float(bar["close"])) / 3.0
+        vol = float(bar["volume"])
+        idx = min(bins - 1, max(0, int((typical - price_min) / bin_width)))
+        vol_by_bin[idx] += vol
+
+    total_vol = sum(vol_by_bin)
+    if total_vol <= 0.0:
+        return None
+
+    poc_idx = max(range(bins), key=lambda i: vol_by_bin[i])
+    captured = vol_by_bin[poc_idx]
+    low_idx = poc_idx
+    high_idx = poc_idx
+
+    while captured < 0.70 * total_vol and (low_idx > 0 or high_idx < bins - 1):
+        left_vol = vol_by_bin[low_idx - 1] if low_idx > 0 else -1.0
+        right_vol = vol_by_bin[high_idx + 1] if high_idx < bins - 1 else -1.0
+        if left_vol >= right_vol and low_idx > 0:
+            low_idx -= 1
+            captured += vol_by_bin[low_idx]
+        elif high_idx < bins - 1:
+            high_idx += 1
+            captured += vol_by_bin[high_idx]
+        else:
+            break
+
+    mean_vol = total_vol / bins
+    # Check if VAL bin (or adjacent bin) is a Low Volume Node (< 60% of mean bin volume)
+    candidate_indices = [i for i in range(max(0, low_idx - 1), min(bins, low_idx + 2))]
+    lvn_idx = min(candidate_indices, key=lambda i: vol_by_bin[i])
+    if vol_by_bin[lvn_idx] >= 0.60 * mean_vol:
+        return None
+
+    lvn_low = price_min + (lvn_idx * bin_width)
+    lvn_high = lvn_low + bin_width
+    return (lvn_low, lvn_high)
+
+
+def _evaluate_lvn_absorption_squeeze(state: AgentState) -> TradeIntent | None:
+    """Strategy 4: 60-bar Rolling Volume Profile VAL/LVN Absorption Squeeze."""
+    symbol = state.get("asset_symbol", "BTC/USD")
+    df_exec = _get_symbol_dataframe(state, symbol)
+    if df_exec is None or df_exec.empty or not {"open", "high", "low", "close"}.issubset(df_exec.columns):
+        return None
+
+    current_price = float(state.get("current_price", 0.0))
+    if current_price <= 0.0:
+        current_price = float(df_exec["close"].iloc[-1])
+    if current_price <= 0.0:
+        return None
+
+    conn = duckdb.connect(DB_PATH)
+    try:
+        _ensure_setup_table(conn)
+        row = conn.execute(
+            """
+            SELECT setup_id, phase, sweep_low, target_price
+            FROM setup_state_machine
+            WHERE strategy = ?
+              AND phase IN ('PHASE_1_LVN_IDENTIFIED', 'PHASE_2_ABSORPTION')
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            [LVN_ABSORPTION_STRATEGY],
+        ).fetchone()
+
+        # Phase 1 (PHASE_1_LVN_IDENTIFIED): 60-bar rolling Volume Profile VAL + LVN
+        if row is None:
+            lvn_zone = _compute_rolling_val_and_lvn(df_exec)
+            if lvn_zone is None:
+                return None
+            lvn_low, lvn_high = lvn_zone
+            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+            setup_id = f"LVN-LONG-{now_naive.strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+            conn.execute(
+                """
+                INSERT INTO setup_state_machine (
+                    setup_id, strategy, phase, sweep_low, target_price, timestamp
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [setup_id, LVN_ABSORPTION_STRATEGY, "PHASE_1_LVN_IDENTIFIED", lvn_low, lvn_high, now_naive],
+            )
+            print(
+                f"[Scalper] LVN Phase 1 Identified ({setup_id}): "
+                f"VAL/LVN zone [{lvn_low:.2f}, {lvn_high:.2f}]"
+            )
+            return None
+
+        setup_id, phase = str(row[0]), str(row[1])
+        if row[2] is None or row[3] is None:
+            return None
+
+        # Phase 2 (PHASE_2_ABSORPTION): Price enters LVN with high sell volume + narrow body / lower wick
+        if phase == "PHASE_1_LVN_IDENTIFIED":
+            if "volume" not in df_exec.columns or len(df_exec) < 20:
+                return None
+            lvn_low, lvn_high = float(row[2]), float(row[3])
+            curr = df_exec.iloc[-1]
+            curr_open, curr_high, curr_low, curr_close = (
+                float(curr["open"]),
+                float(curr["high"]),
+                float(curr["low"]),
+                float(curr["close"]),
+            )
+            curr_vol = float(curr["volume"])
+            avg_vol = float(df_exec["volume"].tail(20).mean())
+            candle_range = curr_high - curr_low
+            if candle_range <= 0.0 or avg_vol <= 0.0:
+                return None
+
+            body = abs(curr_close - curr_open)
+            lower_wick = min(curr_open, curr_close) - curr_low
+            in_lvn = curr_low <= lvn_high and curr_close >= (lvn_low * 0.999)
+            high_rel_vol = curr_vol >= 1.5 * avg_vol
+            no_follow_through = (body <= 0.35 * candle_range) or (lower_wick >= 0.50 * candle_range)
+
+            if in_lvn and high_rel_vol and no_follow_through:
+                conn.execute(
+                    """
+                    UPDATE setup_state_machine
+                    SET phase = 'PHASE_2_ABSORPTION', sweep_low = ?, target_price = ?
+                    WHERE setup_id = ?
+                    """,
+                    [curr_low, curr_high, setup_id],
+                )
+                print(
+                    f"[Scalper] LVN Phase 2 Absorption ({setup_id}): "
+                    f"vol={curr_vol:.1f} (>1.5x avg), low=${curr_low:.2f}, high=${curr_high:.2f}"
+                )
+            return None
+
+        # Phase 3 (PHASE_3_SQUEEZE_EXECUTION): Break above absorption candle high -> MARKET_BUY
+        if phase == "PHASE_2_ABSORPTION":
+            absorption_low, absorption_high = float(row[2]), float(row[3])
+            if current_price > absorption_high:
+                conn.execute(
+                    "UPDATE setup_state_machine SET phase = 'PHASE_3_SQUEEZE_EXECUTION' WHERE setup_id = ?",
+                    [setup_id],
+                )
+                rationale = (
+                    f"LVN Absorption Squeeze MARKET_BUY on {symbol} ({setup_id}): "
+                    f"price ${current_price:.2f} broke above absorption high ${absorption_high:.2f}, "
+                    f"raw_sl=${absorption_low:.2f}."
+                )
+                print(f"[Scalper] {rationale}")
+                return TradeIntent(
+                    symbol=symbol,
+                    action="MARKET_BUY",
+                    target_price=round(current_price, 6),
+                    qty=round(TRANCHE_NOTIONAL_USD / current_price, QTY_PRECISION),
+                    notional_usd=TRANCHE_NOTIONAL_USD,
+                    raw_stop_loss=round(absorption_low, 6),
+                    rationale=rationale,
+                )
+    finally:
+        conn.close()
+
+    return None
+
+
 def scalper_expert_node(state: AgentState) -> AgentState:
     """Scan ``state['asset_symbols']`` and emit maker-only ``TradeIntent`` objects."""
+    if str(state.get("market_regime", "")).upper() == "SESSION_OPEN_WATCH":
+        return _evaluate_session_open_reversion(state)
+
+    for strategy_fn in (
+        _evaluate_crt_rebreak,
+        _evaluate_smc_golden_fvg,
+        _evaluate_lvn_absorption_squeeze,
+    ):
+        strategy_intent = strategy_fn(state)
+        if strategy_intent is not None:
+            return {
+                **state,
+                "trade_intents": [strategy_intent],
+                "action": strategy_intent.action,
+                "target_price": strategy_intent.target_price,
+                "rationale": strategy_intent.rationale,
+            }
+
     symbols = state.get("asset_symbols") or [state.get("asset_symbol", "BTC/USD")]
     intents: list[TradeIntent] = []
 

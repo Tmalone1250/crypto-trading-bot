@@ -9,9 +9,9 @@ class TradeIntent(BaseModel):
     """Structured maker-only trade intent emitted by the multi-asset Scalper Expert."""
 
     symbol: str = Field(..., description="Target trading pair (e.g., 'BTC/USD').")
-    action: Literal["LIMIT_BUY", "LIMIT_SELL"] = Field(
+    action: Literal["LIMIT_BUY", "LIMIT_SELL", "MARKET_BUY", "MARKET_SELL"] = Field(
         ...,
-        description="Maker-only limit action ('LIMIT_BUY' or 'LIMIT_SELL').",
+        description="Trade intent action ('LIMIT_BUY', 'LIMIT_SELL', 'MARKET_BUY', or 'MARKET_SELL').",
     )
     target_price: float = Field(..., gt=0.0, description="Limit order price.")
     qty: float = Field(..., gt=0.0, description="Order quantity in base asset.")
@@ -19,6 +19,11 @@ class TradeIntent(BaseModel):
         default=200.0,
         gt=0.0,
         description="Fixed USD notional per tranche (default $200.00).",
+    )
+    raw_stop_loss: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Optional structural swing high/low raw stop-loss for 1.5R risk sizing.",
     )
     rationale: str = Field(..., description="Quantitative rationale for this intent.")
 
