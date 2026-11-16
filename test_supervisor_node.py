@@ -9,6 +9,8 @@ from supervisor_node import FLAT_RATIONALE, supervisor_node
 
 REQUIRED_STATE_KEYS = {
     "asset_symbol",
+    "asset_symbols",
+    "market_data_by_symbol",
     "current_price",
     "historical_data",
     "sentiment_score",
@@ -23,6 +25,7 @@ REQUIRED_STATE_KEYS = {
     "rationale",
     "market_regime",
     "realized_pnl",
+    "trade_intents",
 }
 
 
@@ -30,6 +33,8 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     """Validate that ``state`` conforms to the ``AgentState`` schema and types."""
     assert set(state.keys()) == REQUIRED_STATE_KEYS
     assert isinstance(state["asset_symbol"], str)
+    assert isinstance(state["asset_symbols"], list)
+    assert isinstance(state["market_data_by_symbol"], dict)
     assert isinstance(state["current_price"], float)
     assert isinstance(state["historical_data"], pd.DataFrame)
     assert isinstance(state["sentiment_score"], float)
@@ -44,12 +49,15 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["rationale"], str)
     assert isinstance(state["market_regime"], str)
     assert isinstance(state["realized_pnl"], float)
+    assert isinstance(state["trade_intents"], list)
 
 
 def _make_state(df: pd.DataFrame) -> AgentState:
     """Build a valid ``AgentState`` with the given OHLCV DataFrame."""
     return {
         "asset_symbol": "BTC/USD",
+        "asset_symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
+        "market_data_by_symbol": {},
         "current_price": 90000.0,
         "historical_data": df,
         "sentiment_score": 0.0,
@@ -64,6 +72,7 @@ def _make_state(df: pd.DataFrame) -> AgentState:
         "rationale": "",
         "market_regime": "",
         "realized_pnl": 0.0,
+        "trade_intents": [],
     }
 
 

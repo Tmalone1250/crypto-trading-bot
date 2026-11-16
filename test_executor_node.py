@@ -13,11 +13,13 @@ from executor_node import (
     execution_node,
     place_crypto_order,
 )
-from state import AgentState
+from state import AgentState, TradeIntent
 
 
 REQUIRED_STATE_KEYS = {
     "asset_symbol",
+    "asset_symbols",
+    "market_data_by_symbol",
     "current_price",
     "historical_data",
     "sentiment_score",
@@ -32,6 +34,7 @@ REQUIRED_STATE_KEYS = {
     "rationale",
     "market_regime",
     "realized_pnl",
+    "trade_intents",
 }
 
 
@@ -39,6 +42,8 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     """Validate that ``state`` conforms to the ``AgentState`` schema and types."""
     assert set(state.keys()) == REQUIRED_STATE_KEYS
     assert isinstance(state["asset_symbol"], str)
+    assert isinstance(state["asset_symbols"], list)
+    assert isinstance(state["market_data_by_symbol"], dict)
     assert isinstance(state["current_price"], float)
     assert isinstance(state["historical_data"], pd.DataFrame)
     assert isinstance(state["sentiment_score"], float)
@@ -53,6 +58,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["rationale"], str)
     assert isinstance(state["market_regime"], str)
     assert isinstance(state["realized_pnl"], float)
+    assert isinstance(state["trade_intents"], list)
 
 
 class _PersistentInMemoryConn:
@@ -76,6 +82,8 @@ def _build_ready_state(
     """Build a sample ``AgentState`` ready for Node 4 testing."""
     return {
         "asset_symbol": "BTC/USD",
+        "asset_symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
+        "market_data_by_symbol": {},
         "current_price": 95000.0,
         "historical_data": pd.DataFrame({"close": [94800.0, 95000.0]}),
         "sentiment_score": 0.85,
@@ -101,6 +109,7 @@ def _build_ready_state(
         "rationale": "Test execution rationale",
         "market_regime": "ACTIVE",
         "realized_pnl": 0.0,
+        "trade_intents": [],
     }
 
 
@@ -251,6 +260,68 @@ def test_execution_node_limit_sell_and_market_sell_pass_side_sell() -> None:
 
         # (97000 - 95000) * 0.000263 = 0.526; 1.50 + 0.526 = 2.026
         assert updated_war_chest["realized_pnl"] == pytest.approx(2.026)
+    finally:
+        in_mem_conn.close()
+
+
+def test_execution_node_executes_list_of_trade_intents_and_updates_war_chest() -> None:
+    """Verify ``execution_node`` loops through ``trade_intents`` and compounds ``realized_pnl``."""
+    in_mem_conn = duckdb.connect(":memory:")
+    conn_proxy = _PersistentInMemoryConn(in_mem_conn)
+
+    intents = [
+        TradeIntent(
+            symbol="BTC/USD",
+            action="LIMIT_BUY",
+            target_price=90000.0,
+            qty=0.002222,
+            notional_usd=200.0,
+            rationale="Lower-20% buy",
+        ),
+        TradeIntent(
+            symbol="SOL/USD",
+            action="LIMIT_SELL",
+            target_price=102.0,
+            qty=2.0,
+            notional_usd=204.0,
+            rationale="Fee-adjusted +2% sell",
+        ),
+    ]
+    state = _build_ready_state(risk_cleared=True)
+    state["trade_intents"] = intents
+    state["open_positions"] = [{"symbol": "SOLUSD", "avg_entry_price": "100.0", "qty": "2.0"}]
+    state["realized_pnl"] = 1.0
+
+    try:
+        with (
+            patch(
+                "executor_node.place_crypto_order",
+                side_effect=["intent-order-1", "intent-order-2"],
+            ) as mock_mcp,
+            patch("executor_node.duckdb.connect", return_value=conn_proxy),
+        ):
+            updated = execution_node(state)
+
+        assert mock_mcp.call_count == 2
+        first_args = mock_mcp.call_args_list[0].args[0]
+        second_args = mock_mcp.call_args_list[1].args[0]
+
+        assert first_args["symbol"] == "BTC/USD"
+        assert first_args["side"] == "buy"
+        assert first_args["type"] == "limit"
+        assert first_args["qty"] == "0.002222"
+        assert first_args["limit_price"] == "90000.0"
+
+        assert second_args["symbol"] == "SOL/USD"
+        assert second_args["side"] == "sell"
+        assert second_args["type"] == "limit"
+        assert second_args["qty"] == "2.0"
+        assert second_args["limit_price"] == "102.0"
+
+        _assert_valid_agent_state(updated)
+        assert len(updated["order_details"]["executed_intents"]) == 2
+        # (102.0 - 100.0) * 2.0 = 4.0; 1.0 + 4.0 = 5.0
+        assert updated["realized_pnl"] == pytest.approx(5.0)
     finally:
         in_mem_conn.close()
 

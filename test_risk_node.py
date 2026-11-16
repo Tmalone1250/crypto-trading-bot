@@ -15,6 +15,8 @@ from state import AgentState
 
 REQUIRED_STATE_KEYS = {
     "asset_symbol",
+    "asset_symbols",
+    "market_data_by_symbol",
     "current_price",
     "historical_data",
     "sentiment_score",
@@ -29,6 +31,7 @@ REQUIRED_STATE_KEYS = {
     "rationale",
     "market_regime",
     "realized_pnl",
+    "trade_intents",
 }
 
 
@@ -36,6 +39,8 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     """Validate that ``state`` conforms to the ``AgentState`` schema and types."""
     assert set(state.keys()) == REQUIRED_STATE_KEYS
     assert isinstance(state["asset_symbol"], str)
+    assert isinstance(state["asset_symbols"], list)
+    assert isinstance(state["market_data_by_symbol"], dict)
     assert isinstance(state["current_price"], float)
     assert isinstance(state["historical_data"], pd.DataFrame)
     assert isinstance(state["sentiment_score"], float)
@@ -50,6 +55,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["rationale"], str)
     assert isinstance(state["market_regime"], str)
     assert isinstance(state["realized_pnl"], float)
+    assert isinstance(state["trade_intents"], list)
 
 
 def _build_synthetic_ohlcv(
@@ -80,6 +86,8 @@ def test_risk_manager_node_cleared_low_volatility_and_btc_sizing() -> None:
 
     state: AgentState = {
         "asset_symbol": "BTC/USD",
+        "asset_symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
+        "market_data_by_symbol": {},
         "current_price": current_price,
         "historical_data": df,
         "sentiment_score": 0.82,
@@ -94,6 +102,7 @@ def test_risk_manager_node_cleared_low_volatility_and_btc_sizing() -> None:
         "rationale": "Test limit buy",
         "market_regime": "ACTIVE",
         "realized_pnl": 0.0,
+        "trade_intents": [],
     }
     _assert_valid_agent_state(state)
 
@@ -121,6 +130,8 @@ def test_risk_manager_node_vetoed_high_volatility() -> None:
 
     state: AgentState = {
         "asset_symbol": "SOL/USD",
+        "asset_symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
+        "market_data_by_symbol": {},
         "current_price": current_price,
         "historical_data": df,
         "sentiment_score": 0.82,
@@ -135,6 +146,7 @@ def test_risk_manager_node_vetoed_high_volatility() -> None:
         "rationale": "Test high volatility veto",
         "market_regime": "ACTIVE",
         "realized_pnl": 0.0,
+        "trade_intents": [],
     }
     _assert_valid_agent_state(state)
 

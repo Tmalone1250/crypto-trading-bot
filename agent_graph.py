@@ -158,6 +158,8 @@ if __name__ == "__main__":
     while True:
         initial_state: AgentState = {
             "asset_symbol": target_symbol,
+            "asset_symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
+            "market_data_by_symbol": {},
             "current_price": 0.0,
             "historical_data": pd.DataFrame(),
             "sentiment_score": 0.0,
@@ -172,6 +174,7 @@ if __name__ == "__main__":
             "rationale": "",
             "market_regime": "FLAT",
             "realized_pnl": 0.0,
+            "trade_intents": [],
         }
 
         try:

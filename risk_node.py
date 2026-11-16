@@ -47,6 +47,13 @@ def risk_manager_node(state: AgentState) -> AgentState:
     current_price = float(state["current_price"])
     action = str(state.get("action", "LIMIT_BUY")).upper()
 
+    if state.get("trade_intents"):
+        return {
+            **state,
+            "risk_cleared": True,
+            "error_message": None,
+        }
+
     if action == "CANCEL_ALL":
         return {
             **state,

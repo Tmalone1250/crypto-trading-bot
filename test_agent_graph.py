@@ -20,6 +20,8 @@ def _make_state(**overrides) -> AgentState:
     """Return a valid synthetic ``AgentState`` with optional field overrides."""
     base: AgentState = {
         "asset_symbol": "BTC/USD",
+        "asset_symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
+        "market_data_by_symbol": {},
         "current_price": 90000.0,
         "historical_data": pd.DataFrame(),
         "sentiment_score": 0.0,
@@ -34,6 +36,7 @@ def _make_state(**overrides) -> AgentState:
         "rationale": "",
         "market_regime": "FLAT",
         "realized_pnl": 0.0,
+        "trade_intents": [],
     }
     base.update(overrides)
     return base

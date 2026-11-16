@@ -237,9 +237,11 @@ def _calculate_sell_profit(
     state: AgentState,
     order_details: dict[str, Any],
     qty: float,
+    symbol: str | None = None,
 ) -> float:
     """Estimate rough realized profit in USD for an executed sell order."""
-    target_symbol = state["asset_symbol"].replace("/", "").upper()
+    resolved_symbol = symbol or state["asset_symbol"]
+    target_symbol = resolved_symbol.replace("/", "").upper()
     avg_entry = 0.0
     for pos in state.get("open_positions") or []:
         pos_sym = str(pos.get("symbol", "")).replace("/", "").upper()
@@ -267,15 +269,45 @@ def _calculate_sell_profit(
     return round((sell_price - avg_entry) * qty, 6)
 
 
+def _intent_to_order_details(intent: Any) -> tuple[str, str, float, dict[str, Any]]:
+    """Normalize a ``TradeIntent`` (or dict) into ``(symbol, action, qty, order_details)``."""
+    if isinstance(intent, dict):
+        sym = str(intent["symbol"])
+        act = str(intent["action"]).upper()
+        target_price = float(intent["target_price"])
+        qty = float(intent["qty"])
+    else:
+        sym = str(intent.symbol)
+        act = str(intent.action).upper()
+        target_price = float(intent.target_price)
+        qty = float(intent.qty)
+
+    side = "sell" if act == "LIMIT_SELL" else "buy"
+    details: dict[str, Any] = {
+        "symbol": sym,
+        "side": side,
+        "type": "limit",
+        "order_type": "limit",
+        "time_in_force": "gtc",
+        "qty": str(qty),
+        "limit_price": str(target_price),
+        "position_size": qty,
+        "stop_loss_price": 0.0,
+        "target_price": target_price,
+        "dry_run": _is_dry_run(),
+    }
+    return sym, act, qty, details
+
+
 def execution_node(state: AgentState) -> AgentState:
-    """Execute the LLM's lifecycle action (``MARKET_BUY``, ``LIMIT_BUY``, ``CANCEL_ALL``) via MCP.
+    """Execute risk-cleared trade intents or single lifecycle actions via Alpaca MCP.
 
     Args:
         state: Current ``AgentState`` dictionary.
 
     Returns:
-        Updated ``AgentState`` dictionary with ``order_details`` updated on success,
-        or the original state if ``risk_cleared`` is False.
+        Updated ``AgentState`` dictionary with ``order_details`` and ``realized_pnl``
+        updated on success, or the original state if ``risk_cleared`` is False.
     """
     if state["risk_cleared"] is not True:
         return state
@@ -283,8 +315,56 @@ def execution_node(state: AgentState) -> AgentState:
     symbol = state["asset_symbol"]
     action = str(state.get("action", "LIMIT_BUY")).upper()
     order_details = dict(state["order_details"])
+    trade_intents = state.get("trade_intents") or []
 
     try:
+        if trade_intents:
+            realized_pnl = float(state.get("realized_pnl", 0.0))
+            executed_intents: list[dict[str, Any]] = []
+            last_trade_id = ""
+
+            for intent in trade_intents:
+                intent_sym, intent_act, intent_qty, intent_details = _intent_to_order_details(intent)
+                trade_id = place_crypto_order(intent_details)
+                last_trade_id = trade_id
+                timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
+
+                _log_trade_to_duckdb(
+                    trade_id=trade_id,
+                    symbol=intent_sym,
+                    size=intent_qty,
+                    stop_loss=float(intent_details.get("stop_loss_price", 0.0)),
+                    target=float(intent_details.get("target_price", 0.0)),
+                    timestamp=timestamp,
+                )
+
+                if intent_act == "LIMIT_SELL":
+                    rough_profit = _calculate_sell_profit(
+                        state=state,
+                        order_details=intent_details,
+                        qty=intent_qty,
+                        symbol=intent_sym,
+                    )
+                    realized_pnl = round(realized_pnl + rough_profit, 6)
+
+                executed_intents.append(
+                    {
+                        **intent_details,
+                        "action": intent_act,
+                        "trade_id": trade_id,
+                    }
+                )
+
+            return {
+                **state,
+                "order_details": {
+                    **order_details,
+                    "trade_id": last_trade_id,
+                    "executed_intents": executed_intents,
+                },
+                "realized_pnl": realized_pnl,
+                "error_message": None,
+            }
         if action == "CANCEL_ALL":
             cancel_id = cancel_all_orders()
             updated_order_details = {
