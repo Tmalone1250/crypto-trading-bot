@@ -578,7 +578,10 @@ def _fetch_live_btc_price(client: Any) -> float:
     elif hasattr(client, "get_latest_price") and not _is_unconfigured_mock(client.get_latest_price):
         price = _extract_price_from_quote(client.get_latest_price("BTC/USD"))
     elif hasattr(client, "call_tool") and not _is_unconfigured_mock(client.call_tool):
-        result = client.call_tool("get_crypto_latest_quote", {"symbols": "BTC/USD"})
+        result = client.call_tool(
+            "get_crypto_latest_quote",
+            {"symbols": "BTC/USD", "loc": "us"},
+        )
         price = _extract_price_from_quote(result)
     else:
         raise AttributeError(

@@ -246,6 +246,6 @@ def test_get_live_crypto_price_uses_symbols_plural_parameter() -> None:
 
     mock_client.call_tool.assert_called_once_with(
         "get_crypto_latest_quote",
-        {"symbols": "BTC/USD"},
+        {"symbols": "BTC/USD", "loc": "us"},
     )
     assert price == pytest.approx(91500.0)

@@ -334,7 +334,10 @@ def get_live_crypto_price(symbol: str = "BTC/USD", mcp_client: Any = None) -> fl
     if mcp_client is None:
         return None
     try:
-        result = mcp_client.call_tool("get_crypto_latest_quote", {"symbols": symbol})
+        result = mcp_client.call_tool(
+            "get_crypto_latest_quote",
+            {"symbols": symbol, "loc": "us"},
+        )
         return _extract_live_price_from_mcp_result(result, symbol)
     except Exception:
         return None
