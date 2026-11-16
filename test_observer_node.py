@@ -14,6 +14,7 @@ from observer_node import (
     LOOKBACK_DAYS,
     _format_bars_dataframe,
     get_crypto_bars,
+    get_live_crypto_price,
     market_observer_node,
 )
 from state import AgentState
@@ -231,3 +232,20 @@ def test_get_crypto_bars_calls_mcp_stdio_session_with_12_day_start() -> None:
         },
     )
     assert json.loads(result)["data"]["bars"]["BTC/USD"] == bars
+
+
+def test_get_live_crypto_price_uses_symbols_plural_parameter() -> None:
+    """Verify ``get_live_crypto_price`` passes ``symbols`` (plural) to ``get_crypto_latest_quote``."""
+    mock_client = MagicMock()
+    mock_client.call_tool.return_value = SimpleNamespace(
+        structuredContent={"BTC/USD": {"ask_price": 91510.0, "bid_price": 91490.0}},
+        content=[],
+    )
+
+    price = get_live_crypto_price("BTC/USD", mcp_client=mock_client)
+
+    mock_client.call_tool.assert_called_once_with(
+        "get_crypto_latest_quote",
+        {"symbols": "BTC/USD"},
+    )
+    assert price == pytest.approx(91500.0)
