@@ -14,12 +14,14 @@ import re
 import shlex
 from typing import Any
 
+from alpaca.data.requests import CryptoLatestQuoteRequest
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 import numpy as np
 import pandas as pd
 
+from config import get_alpaca_crypto_data_client
 from state import AgentState
 
 load_dotenv()
@@ -287,64 +289,49 @@ def _format_bars_dataframe(raw_bars: Any, symbol: str) -> pd.DataFrame:
     return df
 
 
-def _extract_live_price_from_mcp_result(result: Any, symbol: str) -> float | None:
-    """Extract a positive live price from an Alpaca MCP ``get_crypto_latest_quote`` result."""
-    payload: Any = getattr(result, "structured_content", None) or getattr(
-        result, "structuredContent", None
-    )
-    if payload is None:
-        content = getattr(result, "content", None) or []
-        text = "\n".join(
-            val for item in content if isinstance((val := getattr(item, "text", None)), str)
-        ).strip()
-        if text:
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                payload = None
-
-    if isinstance(payload, dict):
-        for candidate in _symbol_key_candidates(symbol) + ["data", "quote"]:
-            if candidate in payload and isinstance(payload[candidate], dict):
-                payload = payload[candidate]
+def _extract_sdk_quote_price(quote_response: Any, symbol: str) -> float | None:
+    """Extract ``.ask_price`` (or midpoint) float directly from a native Alpaca SDK quote response."""
+    quote_obj: Any = quote_response
+    if isinstance(quote_response, dict):
+        for candidate in _symbol_key_candidates(symbol):
+            if candidate in quote_response:
+                quote_obj = quote_response[candidate]
+                break
+    elif hasattr(quote_response, "data") and isinstance(quote_response.data, dict):
+        for candidate in _symbol_key_candidates(symbol):
+            if candidate in quote_response.data:
+                quote_obj = quote_response.data[candidate]
                 break
 
-        for key in ("price", "last_price", "p"):
-            if payload.get(key) is not None:
-                val = float(payload[key])
-                if val > 0.0:
-                    return val
+    if isinstance(quote_obj, dict):
+        ask = quote_obj.get("ask_price", quote_obj.get("ap"))
+        bid = quote_obj.get("bid_price", quote_obj.get("bp"))
+    else:
+        ask = getattr(quote_obj, "ask_price", None)
+        bid = getattr(quote_obj, "bid_price", None)
 
-        ask = payload.get("ask_price", payload.get("ap"))
-        bid = payload.get("bid_price", payload.get("bp"))
-        if ask is not None and bid is not None:
-            mid = (float(ask) + float(bid)) / 2.0
-            if mid > 0.0:
-                return mid
-        if ask is not None and float(ask) > 0.0:
-            return float(ask)
-        if bid is not None and float(bid) > 0.0:
-            return float(bid)
-
+    if ask is not None and float(ask) > 0.0 and bid is not None and float(bid) > 0.0:
+        return (float(ask) + float(bid)) / 2.0
+    if ask is not None and float(ask) > 0.0:
+        return float(ask)
+    if bid is not None and float(bid) > 0.0:
+        return float(bid)
     return None
 
 
-def get_live_crypto_price(symbol: str = "BTC/USD", mcp_client: Any = None) -> float | None:
-    """Fetch the live real-time crypto price via Alpaca MCP ``get_crypto_latest_quote``."""
-    if mcp_client is None:
-        return None
+def get_live_crypto_price(symbol: str = "BTC/USD", data_client: Any = None) -> float | None:
+    """Fetch the live real-time crypto quote directly via the native Alpaca Python SDK."""
     try:
-        result = mcp_client.call_tool(
-            "get_crypto_latest_quote",
-            {"symbols": symbol, "loc": "us"},
-        )
-        return _extract_live_price_from_mcp_result(result, symbol)
+        client = data_client if data_client is not None else get_alpaca_crypto_data_client()
+        request = CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
+        quote_response = client.get_crypto_latest_quote(request)
+        return _extract_sdk_quote_price(quote_response, symbol)
     except Exception:
         return None
 
 
 def market_observer_node(state: AgentState) -> AgentState:
-    """Fetch live bars and real-time quote via Alpaca MCP and populate ``current_price``."""
+    """Fetch live bars and native SDK real-time quote to populate ``current_price``."""
     symbol = state["asset_symbol"]
     mcp_client = state.get("mcp_client")
 
@@ -371,12 +358,15 @@ def market_observer_node(state: AgentState) -> AgentState:
             "error_message": f"No market data returned for {symbol}.",
         }
 
-    live_price = get_live_crypto_price(symbol=symbol, mcp_client=mcp_client)
+    live_price = get_live_crypto_price(symbol=symbol)
     latest_price = live_price if live_price is not None else float(df["close"].iloc[-1])
 
-    return {
+    updated_state: dict[str, Any] = {
         **state,
         "historical_data": df,
         "current_price": latest_price,
         "error_message": None,
     }
+    if "live_price" in state:
+        updated_state["live_price"] = latest_price
+    return updated_state  # type: ignore[return-value]

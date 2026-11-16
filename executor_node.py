@@ -17,12 +17,13 @@ import time
 from typing import Any
 import uuid
 
+from alpaca.data.requests import CryptoLatestQuoteRequest
 from dotenv import load_dotenv
 import duckdb
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from config import get_alpaca_paper_config
+from config import get_alpaca_crypto_data_client, get_alpaca_paper_config
 from state import AgentState
 
 load_dotenv()
@@ -566,31 +567,29 @@ def _is_unconfigured_mock(attr: Any) -> bool:
     )
 
 
-def _fetch_live_btc_price(client: Any) -> float:
-    """Fetch the current live BTC/USD price from an Alpaca MCP or SDK client."""
+def _fetch_live_btc_price(client: Any = None) -> float:
+    """Fetch the current live BTC/USD price via the native Alpaca Python SDK."""
     price: float | None = None
-    if hasattr(client, "get_latest_trade") and not _is_unconfigured_mock(client.get_latest_trade):
-        price = _extract_price_from_quote(client.get_latest_trade("BTC/USD"))
-    elif hasattr(client, "get_crypto_latest_quote") and not _is_unconfigured_mock(
+    if client is not None and hasattr(client, "get_crypto_latest_quote") and not _is_unconfigured_mock(
         client.get_crypto_latest_quote
     ):
-        price = _extract_price_from_quote(client.get_crypto_latest_quote("BTC/USD"))
-    elif hasattr(client, "get_latest_price") and not _is_unconfigured_mock(client.get_latest_price):
+        req = CryptoLatestQuoteRequest(symbol_or_symbols="BTC/USD")
+        price = _extract_price_from_quote(client.get_crypto_latest_quote(req))
+    elif client is not None and hasattr(client, "get_latest_trade") and not _is_unconfigured_mock(
+        client.get_latest_trade
+    ):
+        price = _extract_price_from_quote(client.get_latest_trade("BTC/USD"))
+    elif client is not None and hasattr(client, "get_latest_price") and not _is_unconfigured_mock(
+        client.get_latest_price
+    ):
         price = _extract_price_from_quote(client.get_latest_price("BTC/USD"))
-    elif hasattr(client, "call_tool") and not _is_unconfigured_mock(client.call_tool):
-        result = client.call_tool(
-            "get_crypto_latest_quote",
-            {"symbols": "BTC/USD", "loc": "us"},
-        )
-        price = _extract_price_from_quote(result)
     else:
-        raise AttributeError(
-            "Unsupported Alpaca client: expected get_latest_trade, "
-            "get_crypto_latest_quote, get_latest_price, or call_tool."
-        )
+        data_client = get_alpaca_crypto_data_client()
+        req = CryptoLatestQuoteRequest(symbol_or_symbols="BTC/USD")
+        price = _extract_price_from_quote(data_client.get_crypto_latest_quote(req))
 
     if price is None or price <= 0.0:
-        raise ValueError("Unable to parse a positive live BTC/USD price from Alpaca client.")
+        raise ValueError("Unable to parse a positive live BTC/USD price from Alpaca SDK client.")
     return float(price)
 
 

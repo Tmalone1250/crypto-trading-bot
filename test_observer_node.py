@@ -115,7 +115,10 @@ def test_market_observer_node_success(base_state: AgentState) -> None:
     _assert_valid_agent_state(base_state)
     bars = _sample_mcp_bars(3)
 
-    with patch("observer_node.get_crypto_bars", return_value=bars) as mock_mcp:
+    with (
+        patch("observer_node.get_crypto_bars", return_value=bars) as mock_mcp,
+        patch("observer_node.get_live_crypto_price", return_value=None),
+    ):
         updated_state = market_observer_node(base_state)
 
     mock_mcp.assert_called_once_with(symbol="BTC/USD", timeframe=BAR_TIMEFRAME, limit=BAR_LIMIT)
@@ -234,18 +237,31 @@ def test_get_crypto_bars_calls_mcp_stdio_session_with_12_day_start() -> None:
     assert json.loads(result)["data"]["bars"]["BTC/USD"] == bars
 
 
-def test_get_live_crypto_price_uses_symbols_plural_parameter() -> None:
-    """Verify ``get_live_crypto_price`` passes ``symbols`` (plural) to ``get_crypto_latest_quote``."""
-    mock_client = MagicMock()
-    mock_client.call_tool.return_value = SimpleNamespace(
-        structuredContent={"BTC/USD": {"ask_price": 91510.0, "bid_price": 91490.0}},
-        content=[],
-    )
+def test_get_live_crypto_price_uses_native_alpaca_sdk(base_state: AgentState) -> None:
+    """Verify ``get_live_crypto_price`` and ``market_observer_node`` use the native Alpaca SDK."""
+    mock_sdk_client = MagicMock()
+    mock_sdk_client.get_crypto_latest_quote.return_value = {
+        "BTC/USD": SimpleNamespace(ask_price=91510.0, bid_price=91490.0)
+    }
 
-    price = get_live_crypto_price("BTC/USD", mcp_client=mock_client)
+    with patch(
+        "observer_node.get_alpaca_crypto_data_client",
+        return_value=mock_sdk_client,
+    ):
+        price = get_live_crypto_price("BTC/USD")
 
-    mock_client.call_tool.assert_called_once_with(
-        "get_crypto_latest_quote",
-        {"symbols": "BTC/USD", "loc": "us"},
-    )
+    assert mock_sdk_client.get_crypto_latest_quote.call_count == 1
+    req_arg = mock_sdk_client.get_crypto_latest_quote.call_args[0][0]
+    assert req_arg.symbol_or_symbols == ["BTC/USD"] or req_arg.symbol_or_symbols == "BTC/USD"
     assert price == pytest.approx(91500.0)
+
+    bars = _sample_mcp_bars(3)
+    state_with_live: dict = {**base_state, "live_price": 0.0}
+    with (
+        patch("observer_node.get_crypto_bars", return_value=bars),
+        patch("observer_node.get_alpaca_crypto_data_client", return_value=mock_sdk_client),
+    ):
+        updated = market_observer_node(state_with_live)  # type: ignore[arg-type]
+
+    assert updated["current_price"] == pytest.approx(91500.0)
+    assert updated["live_price"] == pytest.approx(91500.0)  # type: ignore[typeddict-item]
