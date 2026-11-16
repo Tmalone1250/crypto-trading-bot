@@ -173,12 +173,19 @@ def alpha_logic_gate_node(state: AgentState) -> AgentState:
 
     portfolio_context = _format_portfolio_context(state)
     market_summary = _format_condensed_market_summary(state)
+    live_price = float(state["current_price"])
 
     system_prompt = (
         "You are an autonomous quantitative crypto portfolio manager with full order "
         "lifecycle authority. Evaluate your current portfolio exposure (available buying "
         "power, open positions, and active open orders) against the recent market data "
         "summary and choose exactly one action:\n"
+        f"CRITICAL MARKET PRICE GROUNDING: The live, real-time {symbol} market price "
+        f"fetched from Alpaca is EXACTLY ${live_price:,.2f} (raw: {live_price:.2f}). "
+        "This injected price is the absolute, non-negotiable current market price. "
+        "You MUST base all limit prices, targets, and evaluations strictly on this injected "
+        "live price and the provided market data — NEVER guess, recall, or infer the current "
+        "price from your own memory.\n\n"
         "- MARKET_BUY: Execute an immediate market buy order when momentum and structure "
         "warrant immediate entry (set target_price to null).\n"
         "- LIMIT_BUY: Place a resting limit buy order at a specific structural support or "

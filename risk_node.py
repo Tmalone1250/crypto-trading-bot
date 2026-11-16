@@ -133,7 +133,6 @@ def risk_manager_node(state: AgentState) -> AgentState:
                     "side": "buy" if is_long else "sell",
                     "order_type": order_type,
                     "time_in_force": DEFAULT_TIME_IN_FORCE,
-                    "extended_hours": False,
                     "limit_price": None if order_type == "market" else float(primary.target_price),
                     "entry_price": float(primary.target_price),
                     "stop_loss_price": risk_calc["stop_loss"],

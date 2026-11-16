@@ -287,8 +287,61 @@ def _format_bars_dataframe(raw_bars: Any, symbol: str) -> pd.DataFrame:
     return df
 
 
+def _extract_live_price_from_mcp_result(result: Any, symbol: str) -> float | None:
+    """Extract a positive live price from an Alpaca MCP ``get_crypto_latest_quote`` result."""
+    payload: Any = getattr(result, "structured_content", None) or getattr(
+        result, "structuredContent", None
+    )
+    if payload is None:
+        content = getattr(result, "content", None) or []
+        text = "\n".join(
+            val for item in content if isinstance((val := getattr(item, "text", None)), str)
+        ).strip()
+        if text:
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = None
+
+    if isinstance(payload, dict):
+        for candidate in _symbol_key_candidates(symbol) + ["data", "quote"]:
+            if candidate in payload and isinstance(payload[candidate], dict):
+                payload = payload[candidate]
+                break
+
+        for key in ("price", "last_price", "p"):
+            if payload.get(key) is not None:
+                val = float(payload[key])
+                if val > 0.0:
+                    return val
+
+        ask = payload.get("ask_price", payload.get("ap"))
+        bid = payload.get("bid_price", payload.get("bp"))
+        if ask is not None and bid is not None:
+            mid = (float(ask) + float(bid)) / 2.0
+            if mid > 0.0:
+                return mid
+        if ask is not None and float(ask) > 0.0:
+            return float(ask)
+        if bid is not None and float(bid) > 0.0:
+            return float(bid)
+
+    return None
+
+
+def get_live_crypto_price(symbol: str = "BTC/USD", mcp_client: Any = None) -> float | None:
+    """Fetch the live real-time crypto price via Alpaca MCP ``get_crypto_latest_quote``."""
+    if mcp_client is None:
+        return None
+    try:
+        result = mcp_client.call_tool("get_crypto_latest_quote", {"symbol": symbol})
+        return _extract_live_price_from_mcp_result(result, symbol)
+    except Exception:
+        return None
+
+
 def market_observer_node(state: AgentState) -> AgentState:
-    """Fetch live hourly bars via Alpaca MCP and populate ``historical_data`` and ``current_price``."""
+    """Fetch live bars and real-time quote via Alpaca MCP and populate ``current_price``."""
     symbol = state["asset_symbol"]
     mcp_client = state.get("mcp_client")
 
@@ -315,7 +368,8 @@ def market_observer_node(state: AgentState) -> AgentState:
             "error_message": f"No market data returned for {symbol}.",
         }
 
-    latest_price = float(df["close"].iloc[-1])
+    live_price = get_live_crypto_price(symbol=symbol, mcp_client=mcp_client)
+    latest_price = live_price if live_price is not None else float(df["close"].iloc[-1])
 
     return {
         **state,

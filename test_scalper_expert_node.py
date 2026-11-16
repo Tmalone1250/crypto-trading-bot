@@ -517,4 +517,4 @@ def test_scalper_lvn_absorption_squeeze_multi_phase(
     risk_out = risk_manager_node(res_p3)
     assert risk_out["risk_cleared"] is True
     assert risk_out["order_details"]["order_type"] == "market"
-    assert risk_out["order_details"]["extended_hours"] is False
+    assert "extended_hours" not in risk_out["order_details"]

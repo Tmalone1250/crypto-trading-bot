@@ -217,8 +217,6 @@ def place_crypto_order(
         limit_price = order_details.get("limit_price", order_details.get("entry_price"))
         if limit_price is not None:
             mcp_args["limit_price"] = str(limit_price)
-    if "extended_hours" in order_details:
-        mcp_args["extended_hours"] = bool(order_details["extended_hours"])
 
     if mcp_client is not None:
         result = mcp_client.call_tool("place_crypto_order", arguments=mcp_args)
@@ -318,7 +316,6 @@ def _intent_to_order_details(intent: Any) -> tuple[str, str, float, dict[str, An
         "type": order_type,
         "order_type": order_type,
         "time_in_force": "gtc",
-        "extended_hours": False,
         "qty": str(qty),
         "position_size": qty,
         "stop_loss_price": 0.0,

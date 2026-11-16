@@ -488,7 +488,7 @@ def test_monitor_trade_and_breakeven_exits_after_max_attempts() -> None:
 
 
 def test_alpaca_paper_config_and_market_intent_flags(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify config.py pins Paper Trading URL/keys and executor passes TIF/extended_hours."""
+    """Verify config.py pins Paper Trading URL/keys and executor omits extended_hours."""
     from config import ALPACA_PAPER_URL, get_alpaca_paper_config
     from executor_node import _intent_to_order_details
 
@@ -514,4 +514,4 @@ def test_alpaca_paper_config_and_market_intent_flags(monkeypatch: pytest.MonkeyP
     assert act == "MARKET_BUY"
     assert details["type"] == "market"
     assert details["time_in_force"] == "gtc"
-    assert details["extended_hours"] is False
+    assert "extended_hours" not in details
