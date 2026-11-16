@@ -42,6 +42,8 @@ REQUIRED_STATE_KEYS = {
     "market_regime",
     "realized_pnl",
     "trade_intents",
+    "last_alpha_eval_price",
+    "mcp_client",
 }
 
 
@@ -66,6 +68,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["market_regime"], str)
     assert isinstance(state["realized_pnl"], float)
     assert isinstance(state["trade_intents"], list)
+    assert isinstance(state["last_alpha_eval_price"], float)
 
 
 def _sample_security_envelope(tool_name: str, data_payload: dict | list) -> str:
@@ -108,6 +111,8 @@ def base_state() -> AgentState:
         "market_regime": "FLAT",
         "realized_pnl": 0.0,
         "trade_intents": [],
+        "last_alpha_eval_price": 0.0,
+        "mcp_client": None,
     }
 
 

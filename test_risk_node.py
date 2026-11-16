@@ -32,6 +32,8 @@ REQUIRED_STATE_KEYS = {
     "market_regime",
     "realized_pnl",
     "trade_intents",
+    "last_alpha_eval_price",
+    "mcp_client",
 }
 
 
@@ -56,6 +58,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["market_regime"], str)
     assert isinstance(state["realized_pnl"], float)
     assert isinstance(state["trade_intents"], list)
+    assert isinstance(state["last_alpha_eval_price"], float)
 
 
 def _build_synthetic_ohlcv(
@@ -103,6 +106,8 @@ def test_risk_manager_node_cleared_low_volatility_and_btc_sizing() -> None:
         "market_regime": "ACTIVE",
         "realized_pnl": 0.0,
         "trade_intents": [],
+        "last_alpha_eval_price": 0.0,
+        "mcp_client": None,
     }
     _assert_valid_agent_state(state)
 
@@ -147,6 +152,8 @@ def test_risk_manager_node_vetoed_high_volatility() -> None:
         "market_regime": "ACTIVE",
         "realized_pnl": 0.0,
         "trade_intents": [],
+        "last_alpha_eval_price": 0.0,
+        "mcp_client": None,
     }
     _assert_valid_agent_state(state)
 

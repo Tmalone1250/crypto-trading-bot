@@ -37,6 +37,8 @@ def _make_state(**overrides) -> AgentState:
         "market_regime": "FLAT",
         "realized_pnl": 0.0,
         "trade_intents": [],
+        "last_alpha_eval_price": 0.0,
+        "mcp_client": None,
     }
     base.update(overrides)
     return base
@@ -46,9 +48,9 @@ def _make_state(**overrides) -> AgentState:
     ("has_data", "error_message", "expected"),
     [
         (True, None, "supervisor"),
-        (True, "Market observer error", END),
-        (False, None, END),
-        (False, "No market data returned", END),
+        (True, "Market observer error", "telemetry"),
+        (False, None, "telemetry"),
+        (False, "No market data returned", "telemetry"),
     ],
 )
 def test_route_after_observer(
@@ -56,7 +58,7 @@ def test_route_after_observer(
     error_message: str | None,
     expected: str,
 ) -> None:
-    """Verify ``route_after_observer`` routes valid data to ``supervisor`` and errors to ``END``."""
+    """Verify ``route_after_observer`` routes valid data to ``supervisor`` and errors to ``telemetry``."""
     df = pd.DataFrame({"close": [90000.0]}) if has_data else pd.DataFrame()
     state = _make_state(historical_data=df, error_message=error_message)
     assert route_after_observer(state) == expected
@@ -83,7 +85,7 @@ def test_route_after_supervisor(market_regime: str, expected: str) -> None:
         ("MARKET_SELL", None, "risk"),
         ("LIMIT_SELL", 93500.0, "risk"),
         ("CANCEL_ALL", None, "risk"),
-        ("HOLD", None, END),
+        ("HOLD", None, "telemetry"),
     ],
 )
 def test_route_after_alpha(
@@ -91,7 +93,7 @@ def test_route_after_alpha(
     target_price: float | None,
     expected: str,
 ) -> None:
-    """Verify ``route_after_alpha`` routes buy, sell, and cancel actions to ``risk`` and ``HOLD`` to ``END``."""
+    """Verify ``route_after_alpha`` routes buy, sell, and cancel actions to ``risk`` and ``HOLD`` to ``telemetry``."""
     state = _make_state(action=action, target_price=target_price)
     assert route_after_alpha(state) == expected
 
@@ -100,17 +102,17 @@ def test_route_after_alpha(
     ("risk_cleared", "expected"),
     [
         (True, "executor"),
-        (False, END),
+        (False, "telemetry"),
     ],
 )
 def test_route_after_risk(risk_cleared: bool, expected: str) -> None:
-    """Verify ``route_after_risk`` routes to ``executor`` iff ``risk_cleared is True``."""
+    """Verify ``route_after_risk`` routes to ``executor`` iff ``risk_cleared is True``, else ``telemetry``."""
     state = _make_state(risk_cleared=risk_cleared)
     assert route_after_risk(state) == expected
 
 
 def test_graph_compiles_with_expected_nodes() -> None:
-    """Verify the LangGraph workflow compiles cleanly, starts at ``portfolio``, and routes to ``observer``."""
+    """Verify the LangGraph workflow compiles cleanly and all paths converge on ``telemetry`` before ``__end__``."""
     compiled = build_agent_graph()
     assert compiled is not None
     assert app is not None
@@ -126,12 +128,21 @@ def test_graph_compiles_with_expected_nodes() -> None:
         "alpha",
         "risk",
         "executor",
+        "telemetry",
     }.issubset(node_names)
 
     edges = {(edge.source, edge.target) for edge in graph_view.edges}
     assert ("__start__", "portfolio") in edges
     assert ("portfolio", "observer") in edges
     assert ("observer", "supervisor") in edges
+    assert ("observer", "telemetry") in edges
     assert ("supervisor", "alpha") in edges
     assert ("supervisor", "scalper") in edges
     assert ("scalper", "risk") in edges
+    assert ("scalper", "telemetry") in edges
+    assert ("alpha", "risk") in edges
+    assert ("alpha", "telemetry") in edges
+    assert ("risk", "executor") in edges
+    assert ("risk", "telemetry") in edges
+    assert ("executor", "telemetry") in edges
+    assert ("telemetry", END) in edges

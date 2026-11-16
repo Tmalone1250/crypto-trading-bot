@@ -11,12 +11,14 @@ from langgraph.graph import END, StateGraph
 
 from alpha_node import alpha_logic_gate_node
 from executor_node import execution_node
+from mcp_client import PersistentAlpacaMCPClient
 from observer_node import market_observer_node
 from portfolio_node import portfolio_node
 from risk_node import risk_manager_node
 from scalper_expert_node import scalper_expert_node
 from state import AgentState
 from supervisor_node import supervisor_node
+from telemetry_node import telemetry_node
 
 SENTIMENT_THRESHOLD: float = 0.5
 SCAN_INTERVAL_SECONDS: int = 60
@@ -26,18 +28,18 @@ EXECUTABLE_ACTIONS: frozenset[str] = frozenset(
 
 
 def route_after_observer(state: AgentState) -> str:
-    """Route to ``supervisor`` only when Node 1 populated ``historical_data`` without errors.
+    """Route to ``supervisor`` on valid data, or ``telemetry`` on errors/empty data.
 
     Args:
         state: Current ``AgentState`` dictionary after Node 1 execution.
 
     Returns:
-        ``END`` if ``error_message`` is set or ``historical_data`` is empty,
+        ``"telemetry"`` if ``error_message`` is set or ``historical_data`` is empty,
         otherwise ``"supervisor"``.
     """
     df = state["historical_data"]
     if state["error_message"] is not None or df is None or df.empty:
-        return END
+        return "telemetry"
     return "supervisor"
 
 
@@ -57,7 +59,7 @@ def route_after_supervisor(state: AgentState) -> str:
 
 
 def route_after_alpha(state: AgentState) -> str:
-    """Route buy, sell, and cancellation actions downstream, and ``HOLD`` to ``END``.
+    """Route buy, sell, and cancellation actions downstream, and ``HOLD`` to ``telemetry``.
 
     Args:
         state: Current ``AgentState`` dictionary after Node 2 execution.
@@ -65,33 +67,33 @@ def route_after_alpha(state: AgentState) -> str:
     Returns:
         ``"risk"`` if ``action`` is in
         ``{"MARKET_BUY", "LIMIT_BUY", "MARKET_SELL", "LIMIT_SELL", "CANCEL_ALL"}``,
-        otherwise ``END``.
+        otherwise ``"telemetry"``.
     """
     action = str(state.get("action", "HOLD")).upper()
     if action in EXECUTABLE_ACTIONS:
         return "risk"
-    return END
+    return "telemetry"
 
 
 def route_after_risk(state: AgentState) -> str:
-    """Route to ``executor`` only when Node 3 clears micro-fund risk limits.
+    """Route to ``executor`` when risk clears, or ``telemetry`` when vetoed.
 
     Args:
         state: Current ``AgentState`` dictionary after Node 3 execution.
 
     Returns:
-        ``"executor"`` if ``risk_cleared is True``, otherwise ``END``.
+        ``"executor"`` if ``risk_cleared is True``, otherwise ``"telemetry"``.
     """
     if state["risk_cleared"] is True:
         return "executor"
-    return END
+    return "telemetry"
 
 
 def build_agent_graph():
     """Construct and compile the deterministic LangGraph trading workflow."""
     graph = StateGraph(AgentState)
 
-    # Register all seven deterministic swarm execution nodes.
+    # Register all eight deterministic swarm execution nodes.
     graph.add_node("portfolio", portfolio_node)
     graph.add_node("observer", market_observer_node)
     graph.add_node("supervisor", supervisor_node)
@@ -99,6 +101,7 @@ def build_agent_graph():
     graph.add_node("alpha", alpha_logic_gate_node)
     graph.add_node("risk", risk_manager_node)
     graph.add_node("executor", execution_node)
+    graph.add_node("telemetry", telemetry_node)
 
     # Wire entry point (START -> portfolio -> observer -> supervisor) and conditional transitions.
     graph.set_entry_point("portfolio")
@@ -108,7 +111,7 @@ def build_agent_graph():
         route_after_observer,
         {
             "supervisor": "supervisor",
-            END: END,
+            "telemetry": "telemetry",
         },
     )
     graph.add_conditional_edges(
@@ -124,7 +127,7 @@ def build_agent_graph():
         route_after_alpha,
         {
             "risk": "risk",
-            END: END,
+            "telemetry": "telemetry",
         },
     )
     graph.add_conditional_edges(
@@ -132,7 +135,7 @@ def build_agent_graph():
         route_after_alpha,
         {
             "risk": "risk",
-            END: END,
+            "telemetry": "telemetry",
         },
     )
     graph.add_conditional_edges(
@@ -140,10 +143,11 @@ def build_agent_graph():
         route_after_risk,
         {
             "executor": "executor",
-            END: END,
+            "telemetry": "telemetry",
         },
     )
-    graph.add_edge("executor", END)
+    graph.add_edge("executor", "telemetry")
+    graph.add_edge("telemetry", END)
 
     return graph.compile()
 
@@ -152,40 +156,50 @@ app = build_agent_graph()
 
 
 if __name__ == "__main__":
-    print("🚀 Quant Agent Online. Beginning market scanning loop...")
+    print("🚀 Quant Agent Online. Booting persistent Alpaca MCP server...")
     target_symbol = os.environ.get("ASSET_SYMBOL", "BTC/USD")
+    last_alpha_eval_price: float = 0.0
+    realized_pnl: float = 0.0
 
-    while True:
-        initial_state: AgentState = {
-            "asset_symbol": target_symbol,
-            "asset_symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
-            "market_data_by_symbol": {},
-            "current_price": 0.0,
-            "historical_data": pd.DataFrame(),
-            "sentiment_score": 0.0,
-            "risk_cleared": False,
-            "order_details": {},
-            "error_message": None,
-            "account_data": {},
-            "open_positions": [],
-            "active_orders": [],
-            "action": "HOLD",
-            "target_price": None,
-            "rationale": "",
-            "market_regime": "FLAT",
-            "realized_pnl": 0.0,
-            "trade_intents": [],
-        }
+    with PersistentAlpacaMCPClient() as mcp_client:
+        print("✅ Alpaca MCP server initialized. Beginning market scanning loop...")
+        while True:
+            initial_state: AgentState = {
+                "asset_symbol": target_symbol,
+                "asset_symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
+                "market_data_by_symbol": {},
+                "current_price": 0.0,
+                "historical_data": pd.DataFrame(),
+                "sentiment_score": 0.0,
+                "risk_cleared": False,
+                "order_details": {},
+                "error_message": None,
+                "account_data": {},
+                "open_positions": [],
+                "active_orders": [],
+                "action": "HOLD",
+                "target_price": None,
+                "rationale": "",
+                "market_regime": "FLAT",
+                "realized_pnl": realized_pnl,
+                "trade_intents": [],
+                "last_alpha_eval_price": last_alpha_eval_price,
+                "mcp_client": mcp_client,
+            }
 
-        try:
-            result = app.invoke(initial_state)
-            if result.get("error_message"):
-                print(f"[Scan] {result['error_message']}")
-        except KeyboardInterrupt:
-            print("Shutting down Quant Agent scanning loop.")
-            break
-        except Exception as exc:
-            print(f"[Error] Graph execution failed: {exc}")
+            try:
+                result = app.invoke(initial_state)
+                last_alpha_eval_price = float(
+                    result.get("last_alpha_eval_price", last_alpha_eval_price)
+                )
+                realized_pnl = float(result.get("realized_pnl", realized_pnl))
+                if result.get("error_message"):
+                    print(f"[Scan] {result['error_message']}")
+            except KeyboardInterrupt:
+                print("Shutting down Quant Agent scanning loop.")
+                break
+            except Exception as exc:
+                print(f"[Error] Graph execution failed: {exc}")
 
-        # Scan once per minute to respect API and LLM rate limits.
-        time.sleep(SCAN_INTERVAL_SECONDS)
+            # Scan once per minute to respect API and LLM rate limits.
+            time.sleep(SCAN_INTERVAL_SECONDS)

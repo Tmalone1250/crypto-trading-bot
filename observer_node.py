@@ -117,6 +117,7 @@ def get_crypto_bars(
     symbol: str,
     timeframe: str = BAR_TIMEFRAME,
     limit: int = BAR_LIMIT,
+    mcp_client: Any | None = None,
 ) -> Any:
     """Invoke the ``alpaca-mcp-server`` ``get_crypto_bars`` tool via MCP stdio transport.
 
@@ -124,10 +125,25 @@ def get_crypto_bars(
         symbol: Target crypto pair (e.g., ``"BTC/USD"``).
         timeframe: Bar interval string (default ``"1Hour"``).
         limit: Number of historical bars to retrieve (default ``250``).
+        mcp_client: Optional persistent ``PersistentAlpacaMCPClient`` instance.
 
     Returns:
         Raw bar payload from the Alpaca MCP tool.
     """
+    if mcp_client is not None:
+        start_date = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime(
+            "%Y-%m-%d"
+        )
+        result = mcp_client.call_tool(
+            "get_crypto_bars",
+            arguments={
+                "symbols": symbol,
+                "timeframe": timeframe,
+                "limit": limit,
+                "start": start_date,
+            },
+        )
+        return _extract_mcp_result(result)
     return asyncio.run(_fetch_crypto_bars_mcp(symbol, timeframe, limit))
 
 
@@ -274,9 +290,18 @@ def _format_bars_dataframe(raw_bars: Any, symbol: str) -> pd.DataFrame:
 def market_observer_node(state: AgentState) -> AgentState:
     """Fetch live hourly bars via Alpaca MCP and populate ``historical_data`` and ``current_price``."""
     symbol = state["asset_symbol"]
+    mcp_client = state.get("mcp_client")
 
     try:
-        raw_bars = get_crypto_bars(symbol=symbol, timeframe=BAR_TIMEFRAME, limit=BAR_LIMIT)
+        if mcp_client is not None:
+            raw_bars = get_crypto_bars(
+                symbol=symbol,
+                timeframe=BAR_TIMEFRAME,
+                limit=BAR_LIMIT,
+                mcp_client=mcp_client,
+            )
+        else:
+            raw_bars = get_crypto_bars(symbol=symbol, timeframe=BAR_TIMEFRAME, limit=BAR_LIMIT)
         df = _format_bars_dataframe(raw_bars, symbol)
     except Exception as exc:
         return {

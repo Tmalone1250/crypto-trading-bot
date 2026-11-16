@@ -235,6 +235,7 @@ def alpha_logic_gate_node(state: AgentState) -> AgentState:
             "target_price": target_price,
             "rationale": rationale,
             "sentiment_score": sentiment_score,
+            "last_alpha_eval_price": float(state["current_price"]),
             "error_message": None,
         }
     except Exception as exc:
@@ -244,5 +245,6 @@ def alpha_logic_gate_node(state: AgentState) -> AgentState:
             "target_price": None,
             "rationale": "",
             "sentiment_score": 0.0,
+            "last_alpha_eval_price": float(state.get("current_price", 0.0)),
             "error_message": f"Alpha node error for {symbol}: {exc}",
         }

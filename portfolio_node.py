@@ -229,12 +229,38 @@ def get_open_orders() -> list[dict[str, Any]]:
     return get_orders(status="open")
 
 
+def _fetch_portfolio_state_with_client(
+    mcp_client: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch account info, open positions, and active orders using a persistent MCP client."""
+    account_res = mcp_client.call_tool(ACCOUNT_TOOL_NAME, arguments={})
+    positions_res = mcp_client.call_tool(POSITIONS_TOOL_NAME, arguments={})
+    orders_res = mcp_client.call_tool(ORDERS_TOOL_NAME, arguments={"status": "open"})
+
+    account_data = _unpack_account_payload(_extract_mcp_result(account_res))
+    open_positions = _unpack_list_payload(
+        _extract_mcp_result(positions_res),
+        fallback_key="positions",
+    )
+    active_orders = _unpack_list_payload(
+        _extract_mcp_result(orders_res),
+        fallback_key="orders",
+    )
+    return account_data, open_positions, active_orders
+
+
 def portfolio_node(state: AgentState) -> AgentState:
     """Populate ``account_data``, ``open_positions``, and ``active_orders`` via Alpaca MCP."""
+    mcp_client = state.get("mcp_client")
     try:
-        account_data, open_positions, active_orders = asyncio.run(
-            _fetch_portfolio_state_mcp()
-        )
+        if mcp_client is not None:
+            account_data, open_positions, active_orders = _fetch_portfolio_state_with_client(
+                mcp_client
+            )
+        else:
+            account_data, open_positions, active_orders = asyncio.run(
+                _fetch_portfolio_state_mcp()
+            )
     except Exception as exc:
         return {
             **state,

@@ -26,6 +26,8 @@ REQUIRED_STATE_KEYS = {
     "market_regime",
     "realized_pnl",
     "trade_intents",
+    "last_alpha_eval_price",
+    "mcp_client",
 }
 
 
@@ -50,6 +52,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["market_regime"], str)
     assert isinstance(state["realized_pnl"], float)
     assert isinstance(state["trade_intents"], list)
+    assert isinstance(state["last_alpha_eval_price"], float)
 
 
 def _make_state(df: pd.DataFrame) -> AgentState:
@@ -73,6 +76,8 @@ def _make_state(df: pd.DataFrame) -> AgentState:
         "market_regime": "",
         "realized_pnl": 0.0,
         "trade_intents": [],
+        "last_alpha_eval_price": 0.0,
+        "mcp_client": None,
     }
 
 
@@ -133,3 +138,29 @@ def test_supervisor_node_empty_dataframe_defaults_to_flat() -> None:
     assert updated_state["market_regime"] == "FLAT"
     assert updated_state["action"] == "HOLD"
     assert updated_state["rationale"] == FLAT_RATIONALE
+
+
+def test_supervisor_node_gates_active_on_0_20_percent_move_from_last_alpha_eval() -> None:
+    """Verify >= 0.25% range still defers to ``FLAT`` if price moved < 0.20% from ``last_alpha_eval_price``."""
+    active_df = pd.DataFrame(
+        {
+            "high": [90100.0, 90150.0, 90300.0, 90200.0, 90250.0],
+            "low": [90000.0, 90050.0, 90100.0, 90080.0, 90120.0],
+            "close": [90050.0, 90100.0, 90250.0, 90150.0, 90200.0],
+        }
+    )
+
+    # 90100 vs 90000 = 0.111% (< 0.20%) -> FLAT (save tokens, let Scalper run)
+    state_small_move = _make_state(active_df)
+    state_small_move["last_alpha_eval_price"] = 90000.0
+    state_small_move["current_price"] = 90100.0
+    res_small = supervisor_node(state_small_move)
+    assert res_small["market_regime"] == "FLAT"
+    assert res_small["action"] == "HOLD"
+
+    # 90200 vs 90000 = 0.222% (>= 0.20%) -> ACTIVE (wake Alpha LLM)
+    state_large_move = _make_state(active_df)
+    state_large_move["last_alpha_eval_price"] = 90000.0
+    state_large_move["current_price"] = 90200.0
+    res_large = supervisor_node(state_large_move)
+    assert res_large["market_regime"] == "ACTIVE"

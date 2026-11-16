@@ -26,6 +26,8 @@ REQUIRED_STATE_KEYS = {
     "market_regime",
     "realized_pnl",
     "trade_intents",
+    "last_alpha_eval_price",
+    "mcp_client",
 }
 
 
@@ -70,6 +72,8 @@ def _base_state(
         "market_regime": "FLAT",
         "realized_pnl": 0.0,
         "trade_intents": [],
+        "last_alpha_eval_price": 0.0,
+        "mcp_client": None,
     }
 
 

@@ -137,17 +137,32 @@ async def _cancel_all_orders_mcp() -> Any:
             return _extract_order_id(result)
 
 
-def cancel_all_orders() -> str:
+def cancel_all_orders(mcp_client: Any | None = None) -> str:
     """Cancel all open orders via ``alpaca-mcp-server``'s ``cancel_all_orders`` tool."""
+    if mcp_client is not None:
+        result = mcp_client.call_tool(CANCEL_ALL_TOOL_NAME, arguments={})
+        is_error = bool(
+            getattr(result, "is_error", False) or getattr(result, "isError", False)
+        )
+        content = getattr(result, "content", None) or []
+        if is_error:
+            error_parts = [str(getattr(item, "text", item)) for item in content]
+            raise RuntimeError(
+                " ".join(error_parts) or "Alpaca MCP cancel_all_orders failed."
+            )
+        return str(_extract_order_id(result))
     return str(asyncio.run(_cancel_all_orders_mcp()))
 
 
-def cancel_orders() -> str:
+def cancel_orders(mcp_client: Any | None = None) -> str:
     """Alias for ``cancel_all_orders``."""
-    return cancel_all_orders()
+    return cancel_all_orders(mcp_client=mcp_client)
 
 
-def place_crypto_order(order_details: dict[str, Any]) -> str:
+def place_crypto_order(
+    order_details: dict[str, Any],
+    mcp_client: Any | None = None,
+) -> str:
     """Submit a crypto order via ``alpaca-mcp-server``'s ``place_crypto_order`` tool.
 
     Enforces Alpaca crypto constraints:
@@ -195,6 +210,10 @@ def place_crypto_order(order_details: dict[str, Any]) -> str:
         limit_price = order_details.get("limit_price", order_details.get("entry_price"))
         if limit_price is not None:
             mcp_args["limit_price"] = str(limit_price)
+
+    if mcp_client is not None:
+        result = mcp_client.call_tool("place_crypto_order", arguments=mcp_args)
+        return _extract_order_id(result)
 
     return asyncio.run(_submit_crypto_order_mcp(mcp_args))
 
@@ -316,6 +335,7 @@ def execution_node(state: AgentState) -> AgentState:
     action = str(state.get("action", "LIMIT_BUY")).upper()
     order_details = dict(state["order_details"])
     trade_intents = state.get("trade_intents") or []
+    mcp_client = state.get("mcp_client")
 
     try:
         if trade_intents:
@@ -325,7 +345,11 @@ def execution_node(state: AgentState) -> AgentState:
 
             for intent in trade_intents:
                 intent_sym, intent_act, intent_qty, intent_details = _intent_to_order_details(intent)
-                trade_id = place_crypto_order(intent_details)
+                trade_id = (
+                    place_crypto_order(intent_details, mcp_client=mcp_client)
+                    if mcp_client is not None
+                    else place_crypto_order(intent_details)
+                )
                 last_trade_id = trade_id
                 timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -366,7 +390,11 @@ def execution_node(state: AgentState) -> AgentState:
                 "error_message": None,
             }
         if action == "CANCEL_ALL":
-            cancel_id = cancel_all_orders()
+            cancel_id = (
+                cancel_all_orders(mcp_client=mcp_client)
+                if mcp_client is not None
+                else cancel_all_orders()
+            )
             updated_order_details = {
                 **order_details,
                 "action": "CANCEL_ALL",
@@ -418,7 +446,11 @@ def execution_node(state: AgentState) -> AgentState:
             if order_details.get("limit_price") is not None:
                 order_details["limit_price"] = str(order_details["limit_price"])
 
-        trade_id = place_crypto_order(order_details)
+        trade_id = (
+            place_crypto_order(order_details, mcp_client=mcp_client)
+            if mcp_client is not None
+            else place_crypto_order(order_details)
+        )
         timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
 
         _log_trade_to_duckdb(

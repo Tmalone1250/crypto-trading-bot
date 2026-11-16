@@ -27,6 +27,8 @@ REQUIRED_STATE_KEYS = {
     "market_regime",
     "realized_pnl",
     "trade_intents",
+    "last_alpha_eval_price",
+    "mcp_client",
 }
 
 
@@ -51,6 +53,7 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["market_regime"], str)
     assert isinstance(state["realized_pnl"], float)
     assert isinstance(state["trade_intents"], list)
+    assert isinstance(state["last_alpha_eval_price"], float)
 
 
 @pytest.fixture
@@ -106,6 +109,8 @@ def populated_state() -> AgentState:
         "market_regime": "ACTIVE",
         "realized_pnl": 0.0,
         "trade_intents": [],
+        "last_alpha_eval_price": 0.0,
+        "mcp_client": None,
     }
 
 
@@ -156,6 +161,7 @@ def test_alpha_logic_gate_node_injects_portfolio_state_and_returns_limit_buy(
     assert updated_state["target_price"] == pytest.approx(90400.0)
     assert "structural support" in updated_state["rationale"]
     assert updated_state["sentiment_score"] == pytest.approx(0.78)
+    assert updated_state["last_alpha_eval_price"] == pytest.approx(91650.0)
     assert updated_state["error_message"] is None
 
     captured = capsys.readouterr().out
