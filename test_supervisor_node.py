@@ -224,3 +224,14 @@ def test_supervisor_anchors_fair_price_and_enforces_three_loss_rule(
     assert aborted["market_regime"] == "FLAT"
     assert aborted["action"] == "HOLD"
     assert aborted["rationale"] == THREE_LOSS_RATIONALE
+
+
+def test_supervisor_transitions_circuit_breaker_to_suspended() -> None:
+    """Verify CIRCUIT_BREAKER action transitions market_regime to SUSPENDED."""
+    df = pd.DataFrame({"high": [91200.0], "low": [91000.0], "close": [91150.0]})
+    state = _make_state(df)
+    state["action"] = "CIRCUIT_BREAKER"
+
+    updated = supervisor_node(state)
+    assert updated["market_regime"] == "SUSPENDED"
+    assert updated["action"] == "CIRCUIT_BREAKER"

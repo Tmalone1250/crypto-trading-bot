@@ -51,6 +51,7 @@ class AgentState(TypedDict):
         realized_pnl: Compounding realized profit/loss War Chest in USD (default ``0.0``).
         trade_intents: List of ``TradeIntent`` objects produced by the multi-asset scalper.
         last_alpha_eval_price: Asset price recorded the last time Alpha LLM evaluated the market.
+        macro_context: Formatted high-impact macroeconomic calendar context fetched by Observer.
         mcp_client: Optional persistent ``PersistentAlpacaMCPClient`` shared across the loop.
     """
 
@@ -73,4 +74,5 @@ class AgentState(TypedDict):
     realized_pnl: float
     trade_intents: list[TradeIntent]
     last_alpha_eval_price: float
+    macro_context: str
     mcp_client: Optional[Any]

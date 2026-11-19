@@ -40,6 +40,7 @@ REQUIRED_STATE_KEYS = {
     "realized_pnl",
     "trade_intents",
     "last_alpha_eval_price",
+    "macro_context",
     "mcp_client",
 }
 
@@ -106,6 +107,7 @@ def base_state() -> AgentState:
         "realized_pnl": 0.0,
         "trade_intents": [],
         "last_alpha_eval_price": 0.0,
+        "macro_context": "",
         "mcp_client": None,
     }
 
@@ -118,6 +120,7 @@ def test_market_observer_node_success(base_state: AgentState) -> None:
     with (
         patch("observer_node.get_crypto_bars", return_value=bars) as mock_mcp,
         patch("observer_node.get_live_crypto_price", return_value=None),
+        patch("observer_node._fetch_macro_context", return_value="No high-impact events."),
     ):
         updated_state = market_observer_node(base_state)
 
@@ -260,8 +263,10 @@ def test_get_live_crypto_price_uses_native_alpaca_sdk(base_state: AgentState) ->
     with (
         patch("observer_node.get_crypto_bars", return_value=bars),
         patch("observer_node.get_alpaca_crypto_data_client", return_value=mock_sdk_client),
+        patch("observer_node._fetch_macro_context", return_value="FOMC Rate Decision in 30m"),
     ):
         updated = market_observer_node(state_with_live)  # type: ignore[arg-type]
 
     assert updated["current_price"] == pytest.approx(91500.0)
     assert updated["live_price"] == pytest.approx(91500.0)  # type: ignore[typeddict-item]
+    assert "FOMC Rate Decision" in updated["macro_context"]

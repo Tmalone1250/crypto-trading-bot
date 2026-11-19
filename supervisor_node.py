@@ -146,7 +146,20 @@ def _extract_opening_price(state: AgentState) -> float:
 
 
 def supervisor_node(state: AgentState, now: datetime | None = None) -> AgentState:
-    """Classify market regime as ``FLAT``, ``ACTIVE``, or ``SESSION_OPEN_WATCH``."""
+    """Classify market regime as ``FLAT``, ``ACTIVE``, ``SESSION_OPEN_WATCH``, or ``SUSPENDED``."""
+    if (
+        str(state.get("action", "")).upper() == "CIRCUIT_BREAKER"
+        or str(state.get("market_regime", "")).upper() == "SUSPENDED"
+    ):
+        print("[Supervisor] CIRCUIT_BREAKER active | Regime: SUSPENDED")
+        return {
+            **state,
+            "market_regime": "SUSPENDED",
+            "action": "CIRCUIT_BREAKER",
+            "rationale": state.get("rationale")
+            or "Macro circuit breaker active. Trading SUSPENDED.",
+        }
+
     current_utc = now or datetime.now(timezone.utc)
     if current_utc.tzinfo is None:
         current_utc = current_utc.replace(tzinfo=timezone.utc)

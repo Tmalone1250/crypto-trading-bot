@@ -518,3 +518,21 @@ def test_scalper_lvn_absorption_squeeze_multi_phase(
     assert risk_out["risk_cleared"] is True
     assert risk_out["order_details"]["order_type"] == "market"
     assert "extended_hours" not in risk_out["order_details"]
+
+
+def test_scalper_bypasses_all_entries_when_suspended() -> None:
+    """Verify SUSPENDED regime bypasses all entry logic and emits 0 intents."""
+    btc_df = _make_df(
+        [90180.0, 90200.0, 90150.0, 90120.0, 90100.0],
+        [90050.0, 90080.0, 90020.0, 90000.0, 90010.0],
+        [90100.0, 90140.0, 90090.0, 90030.0, 90020.0],
+    )
+    state = _base_state(
+        asset_symbols=["BTC/USD"],
+        market_data_by_symbol={"BTC/USD": btc_df},
+    )
+    state["market_regime"] = "SUSPENDED"
+
+    updated = scalper_expert_node(state)
+    assert updated["trade_intents"] == []
+    assert updated["action"] == "CIRCUIT_BREAKER"

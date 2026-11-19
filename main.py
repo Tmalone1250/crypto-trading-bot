@@ -39,6 +39,7 @@ def build_initial_state(
         "realized_pnl": realized_pnl,
         "trade_intents": [],
         "last_alpha_eval_price": last_alpha_eval_price,
+        "macro_context": "",
         "mcp_client": mcp_client,
     }
 

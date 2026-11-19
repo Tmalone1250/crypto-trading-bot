@@ -23,7 +23,7 @@ from telemetry_node import telemetry_node
 SENTIMENT_THRESHOLD: float = 0.5
 SCAN_INTERVAL_SECONDS: int = 60
 EXECUTABLE_ACTIONS: frozenset[str] = frozenset(
-    {"MARKET_BUY", "LIMIT_BUY", "MARKET_SELL", "LIMIT_SELL", "CANCEL_ALL"}
+    {"MARKET_BUY", "LIMIT_BUY", "MARKET_SELL", "LIMIT_SELL", "CANCEL_ALL", "CIRCUIT_BREAKER"}
 )
 
 
@@ -184,6 +184,7 @@ if __name__ == "__main__":
                 "realized_pnl": realized_pnl,
                 "trade_intents": [],
                 "last_alpha_eval_price": last_alpha_eval_price,
+                "macro_context": "",
                 "mcp_client": mcp_client,
             }
 

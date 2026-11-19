@@ -517,3 +517,17 @@ def test_alpaca_paper_config_and_market_intent_flags(monkeypatch: pytest.MonkeyP
     assert details["type"] == "market"
     assert details["time_in_force"] == "gtc"
     assert "extended_hours" not in details
+
+
+def test_execution_node_cancels_all_orders_when_suspended() -> None:
+    """Verify SUSPENDED regime cancels all resting orders immediately."""
+    state = _build_ready_state(risk_cleared=False, action="CIRCUIT_BREAKER")
+    state["market_regime"] = "SUSPENDED"
+
+    with patch("executor_node.cancel_all_orders", return_value="cancelled-all") as mock_cancel:
+        updated = execution_node(state)
+
+    mock_cancel.assert_called_once()
+    assert updated["market_regime"] == "SUSPENDED"
+    assert updated["order_details"]["action"] == "CANCEL_ALL"
+    assert updated["error_message"] is None

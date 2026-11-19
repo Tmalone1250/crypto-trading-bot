@@ -20,6 +20,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 import numpy as np
 import pandas as pd
+import requests
 
 from config import get_alpaca_crypto_data_client
 from state import AgentState
@@ -30,6 +31,9 @@ BAR_TIMEFRAME: str = "1Hour"
 BAR_LIMIT: int = 250
 LOOKBACK_DAYS: int = 12
 OHLCV_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
+MACRO_CALENDAR_URL: str = (
+    "https://www.showmytrades.com/api/public/calendar/v1?currency=USD&impact=high&days=1"
+)
 
 _NUM_PATTERN = r"[-+]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?"
 _TEXT_BAR_REGEX = re.compile(
@@ -330,8 +334,52 @@ def get_live_crypto_price(symbol: str = "BTC/USD", data_client: Any = None) -> f
         return None
 
 
+def _fetch_macro_context(timeout: float = 10.0) -> str:
+    """Fetch upcoming high-impact USD macroeconomic events from the public calendar API."""
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        response = requests.get(MACRO_CALENDAR_URL, timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        return (
+            f"Current UTC Time: {now_iso}\n"
+            f"Macroeconomic calendar unavailable: {exc}"
+        )
+
+    events = payload if isinstance(payload, list) else payload.get("events", payload.get("data", []))
+    if not isinstance(events, list) or not events:
+        return (
+            f"Current UTC Time: {now_iso}\n"
+            "High-Impact USD Macro Calendar (Next 24h): No high-impact events scheduled."
+        )
+
+    lines = [
+        f"Current UTC Time: {now_iso}",
+        "High-Impact USD Macro Calendar (Next 24h):",
+    ]
+    for ev in events[:15]:
+        if not isinstance(ev, dict):
+            continue
+        title = ev.get("title") or ev.get("event") or ev.get("name") or "Unknown Event"
+        ev_time = ev.get("date") or ev.get("time") or ev.get("timestamp") or "TBD"
+        impact = ev.get("impact") or "high"
+        currency = ev.get("currency") or "USD"
+        forecast = ev.get("forecast")
+        previous = ev.get("previous")
+        extras = []
+        if forecast is not None:
+            extras.append(f"forecast={forecast}")
+        if previous is not None:
+            extras.append(f"previous={previous}")
+        extra_str = f" ({', '.join(extras)})" if extras else ""
+        lines.append(f"- [{ev_time}] {currency} ({impact}): {title}{extra_str}")
+
+    return "\n".join(lines)
+
+
 def market_observer_node(state: AgentState) -> AgentState:
-    """Fetch live bars and native SDK real-time quote to populate ``current_price``."""
+    """Fetch live bars, native SDK real-time quote, and macro calendar context."""
     symbol = state["asset_symbol"]
     mcp_client = state.get("mcp_client")
 
@@ -360,11 +408,13 @@ def market_observer_node(state: AgentState) -> AgentState:
 
     live_price = get_live_crypto_price(symbol=symbol)
     latest_price = live_price if live_price is not None else float(df["close"].iloc[-1])
+    macro_context = _fetch_macro_context()
 
     updated_state: dict[str, Any] = {
         **state,
         "historical_data": df,
         "current_price": latest_price,
+        "macro_context": macro_context,
         "error_message": None,
     }
     if "live_price" in state:

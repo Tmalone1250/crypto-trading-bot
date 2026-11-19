@@ -1,10 +1,16 @@
-"""Unit tests for Node 2 (Alpha Logic Gate / Autonomous Quant Manager)."""
+"""Unit tests for Node 2 (Alpha Macro Circuit Breaker via Gemini Decisions API)."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from alpha_node import GEMINI_MODEL, SentimentResponse, alpha_logic_gate_node
+from alpha_node import (
+    CIRCUIT_BREAKER_INSTRUCTION,
+    CIRCUIT_BREAKER_QUESTION_ID,
+    DECISION_MODEL,
+    alpha_logic_gate_node,
+)
 from state import AgentState
 
 
@@ -28,6 +34,7 @@ REQUIRED_STATE_KEYS = {
     "realized_pnl",
     "trade_intents",
     "last_alpha_eval_price",
+    "macro_context",
     "mcp_client",
 }
 
@@ -54,11 +61,12 @@ def _assert_valid_agent_state(state: AgentState) -> None:
     assert isinstance(state["realized_pnl"], float)
     assert isinstance(state["trade_intents"], list)
     assert isinstance(state["last_alpha_eval_price"], float)
+    assert isinstance(state["macro_context"], str)
 
 
 @pytest.fixture
 def populated_state() -> AgentState:
-    """Return a valid ``AgentState`` populated with portfolio state and sample OHLCV data."""
+    """Return a valid ``AgentState`` populated with OHLCV and macro calendar context."""
     df = pd.DataFrame(
         {
             "open": [90000.0, 90500.0, 91000.0],
@@ -83,26 +91,8 @@ def populated_state() -> AgentState:
             "cash": "99979.20",
             "portfolio_value": "99999.89",
         },
-        "open_positions": [
-            {
-                "symbol": "BTCUSD",
-                "side": "long",
-                "qty": "0.000332",
-                "avg_entry_price": "90100.0",
-                "market_value": "30.43",
-                "unrealized_pl": "0.51",
-            }
-        ],
-        "active_orders": [
-            {
-                "id": "ord-open-001",
-                "symbol": "BTC/USD",
-                "side": "buy",
-                "type": "limit",
-                "qty": "0.00025",
-                "limit_price": "89500.0",
-            }
-        ],
+        "open_positions": [],
+        "active_orders": [],
         "action": "HOLD",
         "target_price": None,
         "rationale": "",
@@ -110,113 +100,84 @@ def populated_state() -> AgentState:
         "realized_pnl": 0.0,
         "trade_intents": [],
         "last_alpha_eval_price": 0.0,
+        "macro_context": (
+            "Current UTC Time: 2026-11-18T18:30:00Z\n"
+            "High-Impact USD Macro Calendar (Next 24h):\n"
+            "- [2026-11-18T19:00:00Z] USD (high): FOMC Rate Decision (in 30 minutes)"
+        ),
         "mcp_client": None,
     }
 
 
-def test_alpha_logic_gate_node_injects_portfolio_state_and_returns_limit_buy(
+def test_alpha_fomc_30_minutes_away_triggers_circuit_breaker(
     populated_state: AgentState,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Verify prompt injects portfolio state & condensed bars, and updates action/target_price/rationale."""
+    """Verify mocked FOMC rate decision 30m away with noul > 0.85 triggers CIRCUIT_BREAKER."""
     _assert_valid_agent_state(populated_state)
 
-    mock_structured_llm = MagicMock()
-    mock_structured_llm.invoke.return_value = SentimentResponse(
-        action="LIMIT_BUY",
-        target_price=90400.0,
-        rationale="Place resting limit bid at hourly structural support near $90,400.",
-        sentiment_score=0.78,
+    mock_decision_response = SimpleNamespace(
+        answers={CIRCUIT_BREAKER_QUESTION_ID: SimpleNamespace(noul=0.94)}
     )
+    mock_client = MagicMock()
+    mock_client.decisions.create.return_value = mock_decision_response
 
-    mock_llm_instance = MagicMock()
-    mock_llm_instance.with_structured_output.return_value = mock_structured_llm
-
-    with patch("alpha_node.ChatGoogleGenerativeAI", return_value=mock_llm_instance) as mock_cls:
+    with patch("alpha_node.genai.Client", return_value=mock_client):
         updated_state = alpha_logic_gate_node(populated_state)
 
-    mock_cls.assert_called_once()
-    assert mock_cls.call_args.kwargs["model"] == GEMINI_MODEL
-    mock_llm_instance.with_structured_output.assert_called_once_with(SentimentResponse)
-    mock_structured_llm.invoke.assert_called_once()
-
-    messages = mock_structured_llm.invoke.call_args.args[0]
-    assert len(messages) == 2
-    system_content = messages[0].content
-    human_content = messages[1].content
-
-    assert "399916.80" in system_content
-    assert "Market Regime: ACTIVE" in system_content
-    assert "BTCUSD" in system_content
-    assert "LIMIT_BUY" in system_content
-    assert "LIMIT_SELL" in system_content
-    assert "MARKET_SELL" in system_content
-    assert "avg_entry_price" in system_content
-    assert "CANCEL_ALL" in system_content
-    assert "Window Summary (3 bars)" in human_content
-    assert "BTC/USD" in human_content
-
     _assert_valid_agent_state(updated_state)
-    assert updated_state["action"] == "LIMIT_BUY"
-    assert updated_state["target_price"] == pytest.approx(90400.0)
-    assert "structural support" in updated_state["rationale"]
-    assert updated_state["sentiment_score"] == pytest.approx(0.78)
+    mock_client.decisions.create.assert_called_once_with(
+        model=DECISION_MODEL,
+        input=populated_state["macro_context"],
+        questions={
+            CIRCUIT_BREAKER_QUESTION_ID: {
+                "type": "noul",
+                "instructions": CIRCUIT_BREAKER_INSTRUCTION,
+            }
+        },
+    )
+    assert updated_state["action"] == "CIRCUIT_BREAKER"
+    assert updated_state["target_price"] is None
+    assert updated_state["sentiment_score"] == pytest.approx(-0.94)
     assert updated_state["last_alpha_eval_price"] == pytest.approx(91650.0)
     assert updated_state["error_message"] is None
 
     captured = capsys.readouterr().out
-    assert "[Alpha] Action: LIMIT_BUY" in captured
-    assert "90400.0" in captured
-    assert "structural support" in captured
+    assert "[Alpha] Decision: CIRCUIT_BREAKER" in captured
 
 
-def test_alpha_logic_gate_node_supports_limit_sell_and_market_sell(
-    populated_state: AgentState,
-) -> None:
-    """Verify ``SentimentResponse`` and ``alpha_logic_gate_node`` support ``LIMIT_SELL`` and ``MARKET_SELL``."""
-    mock_structured_llm = MagicMock()
-    mock_structured_llm.invoke.return_value = SentimentResponse(
-        action="LIMIT_SELL",
-        target_price=92500.0,
-        rationale="Position is +2.6% above avg_entry_price; taking profit at resistance.",
-        sentiment_score=0.62,
+def test_alpha_below_threshold_outputs_hold(populated_state: AgentState) -> None:
+    """Verify noul probability <= 0.85 outputs HOLD."""
+    populated_state["macro_context"] = (
+        "Current UTC Time: 2026-11-18T18:30:00Z\n"
+        "High-Impact USD Macro Calendar (Next 24h): No high-impact events scheduled."
     )
+    mock_decision_response = SimpleNamespace(
+        answers={CIRCUIT_BREAKER_QUESTION_ID: SimpleNamespace(noul=0.12)}
+    )
+    mock_client = MagicMock()
+    mock_client.decisions.create.return_value = mock_decision_response
 
-    mock_llm_instance = MagicMock()
-    mock_llm_instance.with_structured_output.return_value = mock_structured_llm
-
-    with patch("alpha_node.ChatGoogleGenerativeAI", return_value=mock_llm_instance):
+    with patch("alpha_node.genai.Client", return_value=mock_client):
         updated_state = alpha_logic_gate_node(populated_state)
 
     _assert_valid_agent_state(updated_state)
-    assert updated_state["action"] == "LIMIT_SELL"
-    assert updated_state["target_price"] == pytest.approx(92500.0)
-    assert "taking profit" in updated_state["rationale"]
+    assert updated_state["action"] == "HOLD"
+    assert updated_state["sentiment_score"] == pytest.approx(0.0)
+    assert updated_state["error_message"] is None
 
 
-def test_alpha_logic_gate_node_api_failure_defaults_hold_and_zero_score(
-    populated_state: AgentState,
-) -> None:
-    """Verify API failure/rate limit defaults ``action`` to ``HOLD`` and ``sentiment_score`` to ``0.0``."""
-    _assert_valid_agent_state(populated_state)
-    populated_state["sentiment_score"] = 0.65
-    populated_state["action"] = "MARKET_BUY"
-    populated_state["target_price"] = 91000.0
-    populated_state["rationale"] = "Previous rationale"
+def test_alpha_decisions_api_failure_defaults_hold(populated_state: AgentState) -> None:
+    """Verify Decisions API failures safely default to HOLD with zero sentiment."""
+    mock_client = MagicMock()
+    mock_client.decisions.create.side_effect = RuntimeError("Decisions API 503")
 
-    mock_structured_llm = MagicMock()
-    mock_structured_llm.invoke.side_effect = RuntimeError("429 Resource Exhausted: rate limit exceeded")
-
-    mock_llm_instance = MagicMock()
-    mock_llm_instance.with_structured_output.return_value = mock_structured_llm
-
-    with patch("alpha_node.ChatGoogleGenerativeAI", return_value=mock_llm_instance):
+    with patch("alpha_node.genai.Client", return_value=mock_client):
         updated_state = alpha_logic_gate_node(populated_state)
 
     _assert_valid_agent_state(updated_state)
     assert updated_state["action"] == "HOLD"
     assert updated_state["target_price"] is None
-    assert updated_state["rationale"] == ""
-    assert updated_state["sentiment_score"] == 0.0
+    assert updated_state["sentiment_score"] == pytest.approx(0.0)
     assert updated_state["error_message"] is not None
-    assert "rate limit exceeded" in updated_state["error_message"]
+    assert "Decisions API 503" in updated_state["error_message"]

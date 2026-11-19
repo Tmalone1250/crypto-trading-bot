@@ -338,14 +338,40 @@ def execution_node(state: AgentState) -> AgentState:
         Updated ``AgentState`` dictionary with ``order_details`` and ``realized_pnl``
         updated on success, or the original state if ``risk_cleared`` is False.
     """
-    if state["risk_cleared"] is not True:
-        return state
-
     symbol = state["asset_symbol"]
     action = str(state.get("action", "LIMIT_BUY")).upper()
+    market_regime = str(state.get("market_regime", "")).upper()
     order_details = dict(state["order_details"])
     trade_intents = state.get("trade_intents") or []
     mcp_client = state.get("mcp_client")
+
+    if market_regime == "SUSPENDED" or action == "CIRCUIT_BREAKER":
+        try:
+            cancel_output = (
+                cancel_all_orders(mcp_client=mcp_client)
+                if mcp_client is not None
+                else cancel_all_orders()
+            )
+            return {
+                **state,
+                "market_regime": "SUSPENDED",
+                "order_details": {
+                    **order_details,
+                    "symbol": symbol,
+                    "action": "CANCEL_ALL",
+                    "cancel_response": cancel_output,
+                    "dry_run": _is_dry_run(),
+                },
+                "error_message": None,
+            }
+        except Exception as exc:
+            return {
+                **state,
+                "error_message": f"Execution node error cancelling orders while SUSPENDED: {exc}",
+            }
+
+    if state["risk_cleared"] is not True:
+        return state
 
     try:
         if trade_intents:

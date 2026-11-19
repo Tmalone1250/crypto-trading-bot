@@ -942,6 +942,19 @@ def _evaluate_lvn_absorption_squeeze(state: AgentState) -> TradeIntent | None:
 
 def scalper_expert_node(state: AgentState) -> AgentState:
     """Scan ``state['asset_symbols']`` and emit maker-only ``TradeIntent`` objects."""
+    if (
+        str(state.get("market_regime", "")).upper() == "SUSPENDED"
+        or str(state.get("action", "")).upper() == "CIRCUIT_BREAKER"
+    ):
+        print("[Scalper] Regime SUSPENDED (CIRCUIT_BREAKER) | Bypassing entries, emitting 0 intents")
+        return {
+            **state,
+            "trade_intents": [],
+            "action": "CIRCUIT_BREAKER",
+            "target_price": None,
+            "rationale": "Trading SUSPENDED by macro circuit breaker. Emitting 0 intents.",
+        }
+
     if str(state.get("market_regime", "")).upper() == "SESSION_OPEN_WATCH":
         return _evaluate_session_open_reversion(state)
 

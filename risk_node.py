@@ -150,7 +150,9 @@ def risk_manager_node(state: AgentState) -> AgentState:
             "error_message": None,
         }
 
-    if action == "CANCEL_ALL":
+    if action in {"CANCEL_ALL", "CIRCUIT_BREAKER"} or str(
+        state.get("market_regime", "")
+    ).upper() == "SUSPENDED":
         return {
             **state,
             "risk_cleared": True,
