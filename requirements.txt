@@ -1,5 +1,8 @@
 langgraph
 langchain-google-genai
+google-genai
+alpaca-py
+requests
 duckdb
 pandas
 numpy

@@ -156,51 +156,6 @@ app = build_agent_graph()
 
 
 if __name__ == "__main__":
-    print("🚀 Quant Agent Online. Booting persistent Alpaca MCP server...")
-    target_symbol = os.environ.get("ASSET_SYMBOL", "BTC/USD")
-    last_alpha_eval_price: float = 0.0
-    realized_pnl: float = 0.0
+    from main import run_daemon
 
-    with PersistentAlpacaMCPClient() as mcp_client:
-        print("✅ Alpaca MCP server initialized. Beginning market scanning loop...")
-        while True:
-            initial_state: AgentState = {
-                "asset_symbol": target_symbol,
-                "asset_symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
-                "market_data_by_symbol": {},
-                "current_price": 0.0,
-                "historical_data": pd.DataFrame(),
-                "sentiment_score": 0.0,
-                "risk_cleared": False,
-                "order_details": {},
-                "error_message": None,
-                "account_data": {},
-                "open_positions": [],
-                "active_orders": [],
-                "action": "HOLD",
-                "target_price": None,
-                "rationale": "",
-                "market_regime": "FLAT",
-                "realized_pnl": realized_pnl,
-                "trade_intents": [],
-                "last_alpha_eval_price": last_alpha_eval_price,
-                "macro_context": "",
-                "mcp_client": mcp_client,
-            }
-
-            try:
-                result = app.invoke(initial_state)
-                last_alpha_eval_price = float(
-                    result.get("last_alpha_eval_price", last_alpha_eval_price)
-                )
-                realized_pnl = float(result.get("realized_pnl", realized_pnl))
-                if result.get("error_message"):
-                    print(f"[Scan] {result['error_message']}")
-            except KeyboardInterrupt:
-                print("Shutting down Quant Agent scanning loop.")
-                break
-            except Exception as exc:
-                print(f"[Error] Graph execution failed: {exc}")
-
-            # Scan once per minute to respect API and LLM rate limits.
-            time.sleep(SCAN_INTERVAL_SECONDS)
+    run_daemon()
