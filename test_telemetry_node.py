@@ -67,12 +67,12 @@ def test_telemetry_node_creates_table_and_inserts_snapshot() -> None:
         rows = in_mem_conn.execute(
             """
             SELECT timestamp, portfolio_value, market_regime, action,
-                   target_price, rationale, scalper_intents
+                   target_price, rationale, scalper_intents, watched_assets
             FROM agent_telemetry
             """
         ).fetchall()
         assert len(rows) == 1
-        ts, port_val, regime, action, target_price, rationale, scalper_intents = rows[0]
+        ts, port_val, regime, action, target_price, rationale, scalper_intents, watched_assets = rows[0]
         assert ts is not None
         assert port_val == pytest.approx(99999.89)
         assert regime == "ACTIVE"
@@ -80,6 +80,12 @@ def test_telemetry_node_creates_table_and_inserts_snapshot() -> None:
         assert target_price == pytest.approx(90400.0)
         assert rationale == "Place resting bid at structural support."
         assert json.loads(scalper_intents) == []
+        parsed_watched = json.loads(watched_assets)
+        assert parsed_watched == {
+            "BTC/USD": 91000.0,
+            "ETH/USD": None,
+            "SOL/USD": None,
+        }
     finally:
         in_mem_conn.close()
 
@@ -181,5 +187,33 @@ def test_telemetry_node_serializes_trade_intents_and_overrides_flat_scalp_headli
         assert parsed_intents[0]["action"] == "LIMIT_BUY"
         assert parsed_intents[1]["symbol"] == "SOL/USD"
         assert parsed_intents[1]["action"] == "LIMIT_SELL"
+    finally:
+        in_mem_conn.close()
+
+
+def test_telemetry_node_serializes_multi_asset_watched_prices() -> None:
+    """Verify ``watched_assets`` maps BTC/USD, ETH/USD, and SOL/USD to their latest prices."""
+    in_mem_conn = duckdb.connect(":memory:")
+    conn_proxy = _PersistentInMemoryConn(in_mem_conn)
+    state = _sample_state(
+        current_price=91250.5,
+        market_data_by_symbol={
+            "ETH/USD": pd.DataFrame([{"close": 3125.75}]),
+            "SOL/USD": pd.DataFrame([{"close": 185.40}]),
+        },
+    )
+
+    try:
+        with patch("telemetry_node.duckdb.connect", return_value=conn_proxy):
+            telemetry_node(state)
+
+        watched_raw = in_mem_conn.execute(
+            "SELECT watched_assets FROM agent_telemetry LIMIT 1"
+        ).fetchone()[0]
+        assert json.loads(watched_raw) == {
+            "BTC/USD": 91250.5,
+            "ETH/USD": 3125.75,
+            "SOL/USD": 185.4,
+        }
     finally:
         in_mem_conn.close()

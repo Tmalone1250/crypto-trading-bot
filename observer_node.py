@@ -410,9 +410,29 @@ def market_observer_node(state: AgentState) -> AgentState:
     latest_price = live_price if live_price is not None else float(df["close"].iloc[-1])
     macro_context = _fetch_macro_context()
 
+    market_data_by_symbol = dict(state.get("market_data_by_symbol") or {})
+    market_data_by_symbol[symbol] = df
+    for extra_sym in state.get("asset_symbols") or []:
+        if extra_sym == symbol or extra_sym in market_data_by_symbol:
+            continue
+        extra_price = get_live_crypto_price(symbol=extra_sym)
+        if extra_price is not None and extra_price > 0.0:
+            market_data_by_symbol[extra_sym] = pd.DataFrame(
+                [
+                    {
+                        "open": extra_price,
+                        "high": extra_price,
+                        "low": extra_price,
+                        "close": extra_price,
+                        "volume": 0.0,
+                    }
+                ]
+            )
+
     updated_state: dict[str, Any] = {
         **state,
         "historical_data": df,
+        "market_data_by_symbol": market_data_by_symbol,
         "current_price": latest_price,
         "macro_context": macro_context,
         "error_message": None,

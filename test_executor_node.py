@@ -531,3 +531,30 @@ def test_execution_node_cancels_all_orders_when_suspended() -> None:
     assert updated["market_regime"] == "SUSPENDED"
     assert updated["order_details"]["action"] == "CANCEL_ALL"
     assert updated["error_message"] is None
+
+
+def test_monitor_trade_and_breakeven_supports_eth_and_sol_symbols() -> None:
+    """Verify ``_fetch_live_price`` and ``monitor_trade_and_breakeven`` work for ETH/USD and SOL/USD."""
+    mock_client = MagicMock()
+    mock_client.get_crypto_latest_quote.side_effect = [
+        {"ETH/USD": SimpleNamespace(ask_price=3000.0, bid_price=3000.0)},
+        {"ETH/USD": SimpleNamespace(ask_price=3006.0, bid_price=3006.0)},
+    ]
+    mock_client.replace_order.return_value = {"id": "ord-eth-1", "stop_price": "3000.0"}
+
+    with patch("executor_node.time.sleep"):
+        result = monitor_trade_and_breakeven(
+            client=mock_client,
+            order_id="ord-eth-1",
+            entry_price=3000.0,
+            is_long=True,
+            symbol="ETH/USD",
+        )
+
+    assert result["breakeven_triggered"] is True
+    assert result["symbol"] == "ETH/USD"
+    assert result["trigger_price"] == pytest.approx(3006.0)
+    mock_client.replace_order.assert_called_once_with(
+        order_id="ord-eth-1",
+        stop_price="3000.0",
+    )

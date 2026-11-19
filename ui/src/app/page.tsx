@@ -36,13 +36,21 @@ interface TelemetryRow {
   target_price: number | null;
   rationale: string;
   scalper_intents: ScalperIntent[];
+  watched_assets?: Record<string, number | null>;
 }
 
 interface TelemetryApiResponse {
   data?: TelemetryRow[];
+  watched_assets?: Record<string, number | null>;
   error?: string;
   warning?: string;
 }
+
+const DEFAULT_WATCHLIST: Record<string, number | null> = {
+  "BTC/USD": null,
+  "ETH/USD": null,
+  "SOL/USD": null,
+};
 
 interface ChartPoint {
   timeLabel: string;
@@ -95,6 +103,8 @@ function getActionBadgeClasses(action: string): string {
 
 export default function CommandCenterPage() {
   const [rows, setRows] = useState<TelemetryRow[]>([]);
+  const [watchedAssets, setWatchedAssets] =
+    useState<Record<string, number | null>>(DEFAULT_WATCHLIST);
   const [lastSync, setLastSync] = useState<string>("--");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
@@ -115,7 +125,13 @@ export default function CommandCenterPage() {
           );
         } else {
           setErrorMessage(payload.error ?? null);
-          setRows(Array.isArray(payload.data) ? payload.data : []);
+          const nextRows = Array.isArray(payload.data) ? payload.data : [];
+          setRows(nextRows);
+          const nextWatched =
+            payload.watched_assets ??
+            nextRows[0]?.watched_assets ??
+            DEFAULT_WATCHLIST;
+          setWatchedAssets(nextWatched);
           setLastSync(
             new Date().toLocaleTimeString([], {
               hour: "2-digit",
@@ -227,6 +243,27 @@ export default function CommandCenterPage() {
             </div>
           </div>
         </header>
+
+        {/* Active Watchlist Strip */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border border-neutral-800 bg-neutral-950 px-5 py-3">
+          <div className="flex items-center gap-2">
+            <span className="h-2 w-2 bg-orange-500" />
+            <span className="font-mono text-xs font-bold uppercase tracking-widest text-neutral-300">
+              Active Watchlist
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            {Object.entries(watchedAssets).map(([symbol, price]) => (
+              <div
+                key={symbol}
+                className="inline-flex items-center gap-2 border border-neutral-800 bg-black px-3 py-1 font-mono text-xs"
+              >
+                <span className="font-bold text-orange-500">{symbol}</span>
+                <span className="text-white">{formatCurrency(price)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
 
         {errorMessage && (
           <div className="border border-orange-500 bg-neutral-950 px-4 py-3 font-mono text-xs text-orange-400">
@@ -376,7 +413,7 @@ export default function CommandCenterPage() {
                             className="border border-orange-500/40 bg-neutral-950 p-2.5 text-xs"
                           >
                             <div className="mb-1 flex items-center justify-between">
-                              <span className="font-bold text-white">
+                              <span className="border border-orange-500/60 bg-black px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-orange-400">
                                 {intent.symbol}
                               </span>
                               <span className="bg-orange-500 px-1.5 py-0.5 text-[10px] font-extrabold uppercase text-black">

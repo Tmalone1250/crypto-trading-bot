@@ -41,6 +41,32 @@ def _serialize_trade_intents(trade_intents: list[Any]) -> str:
     return json.dumps(serialized)
 
 
+def _serialize_watched_assets(state: AgentState) -> str:
+    """Serialize a map of each symbol in ``state['asset_symbols']`` to its latest price."""
+    primary_symbol = str(state.get("asset_symbol", "BTC/USD"))
+    symbols = list(state.get("asset_symbols") or [primary_symbol])
+    market_map = state.get("market_data_by_symbol") or {}
+    current_price = _parse_optional_float(state.get("current_price"))
+
+    watched: dict[str, float | None] = {}
+    for sym in symbols:
+        price: float | None = None
+        if sym == primary_symbol and current_price is not None and current_price > 0.0:
+            price = round(current_price, 6)
+        else:
+            sym_data = market_map.get(sym)
+            if sym_data is None:
+                sym_data = market_map.get(sym.replace("/", ""))
+            if isinstance(sym_data, (int, float)):
+                price = round(float(sym_data), 6)
+            elif hasattr(sym_data, "empty") and not sym_data.empty and "close" in sym_data.columns:
+                closed_val = _parse_optional_float(sym_data["close"].iloc[-1])
+                if closed_val is not None and closed_val > 0.0:
+                    price = round(closed_val, 6)
+        watched[str(sym)] = price
+    return json.dumps(watched)
+
+
 def _log_telemetry_to_duckdb(
     timestamp: datetime,
     portfolio_value: float | None,
@@ -49,8 +75,9 @@ def _log_telemetry_to_duckdb(
     target_price: float | None,
     rationale: str,
     scalper_intents: str,
+    watched_assets: str,
 ) -> None:
-    """Ensure ``agent_telemetry`` exists (with ``scalper_intents``) and insert a snapshot."""
+    """Ensure ``agent_telemetry`` exists (with ``scalper_intents`` & ``watched_assets``) and insert a snapshot."""
     conn = duckdb.connect(DB_PATH)
     try:
         conn.execute(
@@ -62,13 +89,17 @@ def _log_telemetry_to_duckdb(
                 action VARCHAR,
                 target_price DOUBLE,
                 rationale VARCHAR,
-                scalper_intents VARCHAR
+                scalper_intents VARCHAR,
+                watched_assets VARCHAR
             )
             """
         )
-        # Failsafe schema upgrade for pre-existing agent_telemetry tables.
+        # Failsafe schema upgrades for pre-existing agent_telemetry tables.
         conn.execute(
             "ALTER TABLE agent_telemetry ADD COLUMN IF NOT EXISTS scalper_intents VARCHAR"
+        )
+        conn.execute(
+            "ALTER TABLE agent_telemetry ADD COLUMN IF NOT EXISTS watched_assets VARCHAR"
         )
         conn.execute(
             """
@@ -79,9 +110,10 @@ def _log_telemetry_to_duckdb(
                 action,
                 target_price,
                 rationale,
-                scalper_intents
+                scalper_intents,
+                watched_assets
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 timestamp,
@@ -91,6 +123,7 @@ def _log_telemetry_to_duckdb(
                 target_price,
                 rationale,
                 scalper_intents,
+                watched_assets,
             ],
         )
     finally:
@@ -107,6 +140,7 @@ def telemetry_node(state: AgentState) -> AgentState:
     rationale = str(state.get("rationale", ""))
     trade_intents = state.get("trade_intents") or []
     scalper_intents_json = _serialize_trade_intents(trade_intents)
+    watched_assets_json = _serialize_watched_assets(state)
     timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
 
     if market_regime.upper() == "FLAT" and trade_intents:
@@ -122,6 +156,7 @@ def telemetry_node(state: AgentState) -> AgentState:
             target_price=target_price,
             rationale=rationale,
             scalper_intents=scalper_intents_json,
+            watched_assets=watched_assets_json,
         )
         print(
             f"[Telemetry] Logged cycle: regime={market_regime} | action={action} "

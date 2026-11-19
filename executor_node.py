@@ -526,15 +526,15 @@ def execution_node(state: AgentState) -> AgentState:
         }
 
 
-def _extract_price_from_quote(payload: Any) -> float | None:
-    """Extract a numeric BTC/USD price from an Alpaca SDK or MCP quote payload."""
+def _extract_price_from_quote(payload: Any, symbol: str = "BTC/USD") -> float | None:
+    """Extract a numeric crypto price from an Alpaca SDK or MCP quote payload."""
     if isinstance(payload, (int, float)):
         return float(payload)
 
     if hasattr(payload, "content") or hasattr(payload, "structured_content") or hasattr(payload, "structuredContent"):
         structured = getattr(payload, "structured_content", None) or getattr(payload, "structuredContent", None)
         if isinstance(structured, dict):
-            extracted = _extract_price_from_quote(structured)
+            extracted = _extract_price_from_quote(structured, symbol=symbol)
             if extracted is not None:
                 return extracted
         content = getattr(payload, "content", None) or []
@@ -543,16 +543,30 @@ def _extract_price_from_quote(payload: Any) -> float | None:
             if isinstance(text_val, str) and text_val.strip():
                 try:
                     parsed = json.loads(text_val)
-                    extracted = _extract_price_from_quote(parsed)
+                    extracted = _extract_price_from_quote(parsed, symbol=symbol)
                     if extracted is not None:
                         return extracted
                 except json.JSONDecodeError:
                     pass
 
+    slashless = symbol.replace("/", "").upper()
+    candidate_keys = (
+        symbol,
+        slashless,
+        "BTC/USD",
+        "BTCUSD",
+        "ETH/USD",
+        "ETHUSD",
+        "SOL/USD",
+        "SOLUSD",
+        "data",
+        "quote",
+        "trade",
+    )
     if isinstance(payload, dict):
-        for key in ("BTC/USD", "BTCUSD", "data", "quote", "trade"):
+        for key in candidate_keys:
             if key in payload:
-                nested = _extract_price_from_quote(payload[key])
+                nested = _extract_price_from_quote(payload[key], symbol=symbol)
                 if nested is not None:
                     return nested
         for price_key in ("price", "p", "last_price", "close"):
@@ -593,30 +607,35 @@ def _is_unconfigured_mock(attr: Any) -> bool:
     )
 
 
-def _fetch_live_btc_price(client: Any = None) -> float:
-    """Fetch the current live BTC/USD price via the native Alpaca Python SDK."""
+def _fetch_live_price(client: Any = None, symbol: str = "BTC/USD") -> float:
+    """Fetch the current live price for ``symbol`` via the native Alpaca Python SDK."""
     price: float | None = None
     if client is not None and hasattr(client, "get_crypto_latest_quote") and not _is_unconfigured_mock(
         client.get_crypto_latest_quote
     ):
-        req = CryptoLatestQuoteRequest(symbol_or_symbols="BTC/USD")
-        price = _extract_price_from_quote(client.get_crypto_latest_quote(req))
+        req = CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
+        price = _extract_price_from_quote(client.get_crypto_latest_quote(req), symbol=symbol)
     elif client is not None and hasattr(client, "get_latest_trade") and not _is_unconfigured_mock(
         client.get_latest_trade
     ):
-        price = _extract_price_from_quote(client.get_latest_trade("BTC/USD"))
+        price = _extract_price_from_quote(client.get_latest_trade(symbol), symbol=symbol)
     elif client is not None and hasattr(client, "get_latest_price") and not _is_unconfigured_mock(
         client.get_latest_price
     ):
-        price = _extract_price_from_quote(client.get_latest_price("BTC/USD"))
+        price = _extract_price_from_quote(client.get_latest_price(symbol), symbol=symbol)
     else:
         data_client = get_alpaca_crypto_data_client()
-        req = CryptoLatestQuoteRequest(symbol_or_symbols="BTC/USD")
-        price = _extract_price_from_quote(data_client.get_crypto_latest_quote(req))
+        req = CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
+        price = _extract_price_from_quote(data_client.get_crypto_latest_quote(req), symbol=symbol)
 
     if price is None or price <= 0.0:
-        raise ValueError("Unable to parse a positive live BTC/USD price from Alpaca SDK client.")
+        raise ValueError(f"Unable to parse a positive live {symbol} price from Alpaca SDK client.")
     return float(price)
+
+
+def _fetch_live_btc_price(client: Any = None) -> float:
+    """Backwards-compatible alias for ``_fetch_live_price(client, 'BTC/USD')``."""
+    return _fetch_live_price(client=client, symbol="BTC/USD")
 
 
 def _replace_stop_loss_order(client: Any, order_id: str, entry_price: float) -> Any:
@@ -646,8 +665,9 @@ def monitor_trade_and_breakeven(
     is_long: bool,
     poll_interval: float = 1.0,
     max_attempts: int = 60,
+    symbol: str = "BTC/USD",
 ) -> dict[str, Any]:
-    """Poll live BTC/USD every 1s and move stop-loss to breakeven at +0.15% PnL.
+    """Poll live crypto price every 1s and move stop-loss to breakeven at +0.15% PnL.
 
     Args:
         client: Active Alpaca MCP or SDK client instance.
@@ -656,10 +676,11 @@ def monitor_trade_and_breakeven(
         is_long: ``True`` for long positions, ``False`` for short positions.
         poll_interval: Seconds between price polls (defaults to ``1.0``).
         max_attempts: Maximum polling iterations before exiting (defaults to ``60``).
+        symbol: Target trading pair to monitor (e.g., ``"BTC/USD"``, ``"ETH/USD"``, ``"SOL/USD"``).
 
     Returns:
         Summary dictionary with ``breakeven_triggered``, ``order_id``,
-        ``entry_price``, and trigger metrics when triggered.
+        ``symbol``, ``entry_price``, and trigger metrics when triggered.
     """
     entry = float(entry_price)
     if entry <= 0.0:
@@ -667,7 +688,7 @@ def monitor_trade_and_breakeven(
 
     attempts = 0
     while attempts < max_attempts:
-        live_price = _fetch_live_btc_price(client)
+        live_price = _fetch_live_price(client, symbol=symbol)
         unrealized_pnl_pct = (
             (live_price - entry) / entry
             if is_long
@@ -677,13 +698,14 @@ def monitor_trade_and_breakeven(
         if unrealized_pnl_pct >= BREAKEVEN_MOMENTUM_THRESHOLD:
             replace_result = _replace_stop_loss_order(client, str(order_id), entry)
             print(
-                f"[Executor] Breakeven triggered for {order_id}: "
+                f"[Executor] Breakeven triggered for {order_id} ({symbol}): "
                 f"PnL={unrealized_pnl_pct:.4%} >= {BREAKEVEN_MOMENTUM_THRESHOLD:.2%}, "
                 f"moved SL to {entry:.2f}"
             )
             return {
                 "breakeven_triggered": True,
                 "order_id": str(order_id),
+                "symbol": symbol,
                 "entry_price": entry,
                 "trigger_price": live_price,
                 "unrealized_pnl_pct": unrealized_pnl_pct,
@@ -697,6 +719,7 @@ def monitor_trade_and_breakeven(
     return {
         "breakeven_triggered": False,
         "order_id": str(order_id),
+        "symbol": symbol,
         "entry_price": entry,
         "attempts": attempts,
     }

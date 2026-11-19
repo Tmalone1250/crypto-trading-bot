@@ -52,6 +52,28 @@ def _parse_scalper_intents(raw: Any) -> list[dict[str, Any]]:
         return []
 
 
+DEFAULT_WATCHED_ASSETS: dict[str, float | None] = {
+    "BTC/USD": None,
+    "ETH/USD": None,
+    "SOL/USD": None,
+}
+
+
+def _parse_watched_assets(raw: Any) -> dict[str, float | None]:
+    """Safely parse ``watched_assets`` JSON string into a ``symbol -> price`` dict."""
+    if isinstance(raw, dict):
+        return {str(k): _to_nullable_float(v) for k, v in raw.items()}
+    if not isinstance(raw, str) or not raw.strip():
+        return dict(DEFAULT_WATCHED_ASSETS)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and parsed:
+            return {str(k): _to_nullable_float(v) for k, v in parsed.items()}
+    except json.JSONDecodeError:
+        pass
+    return dict(DEFAULT_WATCHED_ASSETS)
+
+
 def query_telemetry_payload(db_path: str = DB_PATH, limit: int = 100) -> dict[str, Any]:
     """Query ``agent_telemetry`` from DuckDB and format JSON payload for the dashboard."""
     conn = duckdb.connect(db_path)
@@ -65,12 +87,16 @@ def query_telemetry_payload(db_path: str = DB_PATH, limit: int = 100) -> dict[st
                 action VARCHAR,
                 target_price DOUBLE,
                 rationale VARCHAR,
-                scalper_intents VARCHAR
+                scalper_intents VARCHAR,
+                watched_assets VARCHAR
             )
             """
         )
         conn.execute(
             "ALTER TABLE agent_telemetry ADD COLUMN IF NOT EXISTS scalper_intents VARCHAR"
+        )
+        conn.execute(
+            "ALTER TABLE agent_telemetry ADD COLUMN IF NOT EXISTS watched_assets VARCHAR"
         )
         raw_rows = conn.execute(
             """
@@ -81,7 +107,8 @@ def query_telemetry_payload(db_path: str = DB_PATH, limit: int = 100) -> dict[st
                 action,
                 target_price,
                 rationale,
-                scalper_intents
+                scalper_intents,
+                watched_assets
             FROM agent_telemetry
             ORDER BY timestamp DESC
             LIMIT ?
@@ -102,6 +129,7 @@ def query_telemetry_payload(db_path: str = DB_PATH, limit: int = 100) -> dict[st
                 "target_price": _to_nullable_float(row[4]),
                 "rationale": str(row[5] or ""),
                 "scalper_intents": _parse_scalper_intents(row[6]),
+                "watched_assets": _parse_watched_assets(row[7]),
             }
         )
 
@@ -117,6 +145,9 @@ def query_telemetry_payload(db_path: str = DB_PATH, limit: int = 100) -> dict[st
 
     return {
         "data": rows,
+        "watched_assets": (
+            latest["watched_assets"] if latest else dict(DEFAULT_WATCHED_ASSETS)
+        ),
         "latest_portfolio_equity": latest["portfolio_value"] if latest else None,
         "market_regime": latest["market_regime"] if latest else "FLAT",
         "latest_sync_timestamp": latest["timestamp"] if latest else None,

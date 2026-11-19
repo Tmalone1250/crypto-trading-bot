@@ -17,6 +17,7 @@ export interface TelemetryRow {
   target_price: number | null;
   rationale: string;
   scalper_intents: ScalperIntent[];
+  watched_assets?: Record<string, number | null>;
 }
 
 export async function GET() {
@@ -57,6 +58,11 @@ export async function GET() {
     return NextResponse.json(
       {
         data: Array.isArray(payload?.data) ? (payload.data as TelemetryRow[]) : [],
+        watched_assets: payload?.watched_assets ?? {
+          "BTC/USD": null,
+          "ETH/USD": null,
+          "SOL/USD": null,
+        },
         latest_portfolio_equity: payload?.latest_portfolio_equity ?? null,
         market_regime: payload?.market_regime ?? "FLAT",
         latest_sync_timestamp: payload?.latest_sync_timestamp ?? null,
