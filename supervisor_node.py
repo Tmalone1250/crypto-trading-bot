@@ -8,7 +8,7 @@ Reversion state machine in DuckDB, enforces the Three-Loss Rule via
   2. Price movement >= 0.20% from ``state["last_alpha_eval_price"]`` (when > 0.0)
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import uuid
 from zoneinfo import ZoneInfo
 import duckdb
@@ -20,6 +20,7 @@ LOOKBACK_CANDLES: int = 5
 VOLATILITY_THRESHOLD_PCT: float = 0.25
 ALPHA_REENTRY_MOVE_PCT: float = 0.20
 FAIR_PRICE_STRATEGY: str = "FAIR_PRICE_REVERSION"
+SESSION_OPEN_EXPIRY_MINUTES: int = 60
 THREE_LOSS_LIMIT: int = 3
 FLAT_RATIONALE: str = "Market is flat. Skipping LLM execution to preserve rate limits."
 THREE_LOSS_RATIONALE: str = (
@@ -89,8 +90,23 @@ def _get_consecutive_losses(conn: duckdb.DuckDBPyConnection, current_date: date)
     return int(row[0])
 
 
-def _has_active_fair_price_setup(conn: duckdb.DuckDBPyConnection) -> bool:
-    """Return True if an active ``FAIR_PRICE_REVERSION`` setup is awaiting Phase 1/2."""
+def _has_active_fair_price_setup(
+    conn: duckdb.DuckDBPyConnection,
+    now_naive: datetime | None = None,
+) -> bool:
+    """Return True if a non-expired ``FAIR_PRICE_REVERSION`` setup is awaiting Phase 1/2."""
+    if now_naive is not None:
+        cutoff = now_naive - timedelta(minutes=SESSION_OPEN_EXPIRY_MINUTES)
+        conn.execute(
+            """
+            UPDATE setup_state_machine
+            SET phase = 'PHASE_EXPIRED'
+            WHERE strategy = ?
+              AND phase IN ('PHASE_0_ANCHORED', 'PHASE_1_DISPLACED')
+              AND timestamp < ?
+            """,
+            [FAIR_PRICE_STRATEGY, cutoff],
+        )
     row = conn.execute(
         """
         SELECT setup_id
@@ -192,7 +208,7 @@ def supervisor_node(state: AgentState, now: datetime | None = None) -> AgentStat
     try:
         _ensure_strategy_tables(conn)
         consecutive_losses = _get_consecutive_losses(conn, current_date)
-        has_active_setup = _has_active_fair_price_setup(conn)
+        has_active_setup = _has_active_fair_price_setup(conn, now_naive=now_naive)
 
         if session_open is not None or has_active_setup:
             if consecutive_losses >= THREE_LOSS_LIMIT:

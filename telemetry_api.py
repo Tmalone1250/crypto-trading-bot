@@ -219,13 +219,19 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path != "/api/telemetry":
-            self._send_json(404, {"data": [], "error": "Not found"})
+        normalized_path = parsed.path.rstrip("/")
+        if normalized_path not in ("", "/api/telemetry", "/telemetry"):
+            self._send_json(404, {"data": [], "error": f"Not found: {parsed.path}"})
             return
 
         expected_key = os.environ.get("TELEMETRY_API_KEY", "").strip()
-        if expected_key:
-            provided_key = self.headers.get("X-API-Key", "")
+        is_direct_loopback = (
+            self.client_address[0] in ("127.0.0.1", "::1")
+            and not self.headers.get("CF-Connecting-IP")
+            and not self.headers.get("X-Forwarded-For")
+        )
+        if expected_key and not is_direct_loopback:
+            provided_key = self.headers.get("X-API-Key", "").strip()
             if provided_key != expected_key:
                 self._send_json(
                     401,

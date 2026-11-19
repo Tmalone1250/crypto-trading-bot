@@ -29,12 +29,19 @@ export interface TelemetryRow {
   asset_phases?: Record<string, string>;
 }
 
+function resolveUpstreamUrl(rawUrl: string | undefined): string {
+  const base = (rawUrl || "http://127.0.0.1:8000/api/telemetry").trim().replace(/\/+$/, "");
+  if (base.endsWith("/api/telemetry")) {
+    return base;
+  }
+  return `${base}/api/telemetry`;
+}
+
 export async function GET() {
   await connection();
 
-  const upstreamUrl =
-    process.env.TELEMETRY_API_URL || "http://127.0.0.1:8000/api/telemetry";
-  const apiKey = process.env.TELEMETRY_API_KEY;
+  const upstreamUrl = resolveUpstreamUrl(process.env.TELEMETRY_API_URL);
+  const apiKey = process.env.TELEMETRY_API_KEY?.trim();
 
   const headers: HeadersInit = {
     Accept: "application/json",
