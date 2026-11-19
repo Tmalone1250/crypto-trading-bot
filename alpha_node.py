@@ -63,7 +63,10 @@ def alpha_logic_gate_node(state: AgentState) -> AgentState:
         }
 
     try:
-        client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+        client = genai.Client(
+            api_key=os.environ.get("GOOGLE_API_KEY"),
+            http_options={"api_version": "v1beta"},
+        )
         result = client.decisions.create(
             model=DECISION_MODEL,
             input=macro_context,

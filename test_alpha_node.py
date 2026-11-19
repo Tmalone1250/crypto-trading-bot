@@ -122,10 +122,11 @@ def test_alpha_fomc_30_minutes_away_triggers_circuit_breaker(
     mock_client = MagicMock()
     mock_client.decisions.create.return_value = mock_decision_response
 
-    with patch("alpha_node.genai.Client", return_value=mock_client):
+    with patch("alpha_node.genai.Client", return_value=mock_client) as mock_client_cls:
         updated_state = alpha_logic_gate_node(populated_state)
 
     _assert_valid_agent_state(updated_state)
+    assert mock_client_cls.call_args.kwargs["http_options"] == {"api_version": "v1beta"}
     mock_client.decisions.create.assert_called_once_with(
         model=DECISION_MODEL,
         input=populated_state["macro_context"],
@@ -158,10 +159,11 @@ def test_alpha_below_threshold_outputs_hold(populated_state: AgentState) -> None
     mock_client = MagicMock()
     mock_client.decisions.create.return_value = mock_decision_response
 
-    with patch("alpha_node.genai.Client", return_value=mock_client):
+    with patch("alpha_node.genai.Client", return_value=mock_client) as mock_client_cls:
         updated_state = alpha_logic_gate_node(populated_state)
 
     _assert_valid_agent_state(updated_state)
+    assert mock_client_cls.call_args.kwargs["http_options"] == {"api_version": "v1beta"}
     assert updated_state["action"] == "HOLD"
     assert updated_state["sentiment_score"] == pytest.approx(0.0)
     assert updated_state["error_message"] is None
@@ -172,10 +174,11 @@ def test_alpha_decisions_api_failure_defaults_hold(populated_state: AgentState) 
     mock_client = MagicMock()
     mock_client.decisions.create.side_effect = RuntimeError("Decisions API 503")
 
-    with patch("alpha_node.genai.Client", return_value=mock_client):
+    with patch("alpha_node.genai.Client", return_value=mock_client) as mock_client_cls:
         updated_state = alpha_logic_gate_node(populated_state)
 
     _assert_valid_agent_state(updated_state)
+    assert mock_client_cls.call_args.kwargs["http_options"] == {"api_version": "v1beta"}
     assert updated_state["action"] == "HOLD"
     assert updated_state["target_price"] is None
     assert updated_state["sentiment_score"] == pytest.approx(0.0)
