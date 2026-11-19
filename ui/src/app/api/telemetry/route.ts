@@ -1,11 +1,8 @@
-import fs from "node:fs";
-import path from "node:path";
 import { connection, NextResponse } from "next/server";
-import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 
 export interface ScalperIntent {
   symbol: string;
-  action: "LIMIT_BUY" | "LIMIT_SELL" | string;
+  action: "LIMIT_BUY" | "LIMIT_SELL" | "MARKET_BUY" | "MARKET_SELL" | string;
   target_price: number;
   qty: number;
   notional_usd?: number;
@@ -22,96 +19,64 @@ export interface TelemetryRow {
   scalper_intents: ScalperIntent[];
 }
 
-function parseScalperIntents(raw: unknown): ScalperIntent[] {
-  if (Array.isArray(raw)) {
-    return raw as ScalperIntent[];
-  }
-  if (typeof raw !== "string" || raw.trim() === "") {
-    return [];
-  }
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as ScalperIntent[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function toNullableNumber(value: unknown): number | null {
-  if (value === null || value === undefined || value === "") {
-    return null;
-  }
-  const num = Number(value);
-  return Number.isFinite(num) ? num : null;
-}
-
 export async function GET() {
   await connection();
-  const dbPath = path.resolve(process.cwd(), "..", "agent_trades.duckdb");
 
-  if (!fs.existsSync(dbPath)) {
-    return NextResponse.json(
-      { data: [], warning: "Telemetry database not found yet." },
-      { status: 200, headers: { "Cache-Control": "no-store" } }
-    );
+  const upstreamUrl =
+    process.env.TELEMETRY_API_URL || "http://127.0.0.1:8000/api/telemetry";
+  const apiKey = process.env.TELEMETRY_API_KEY;
+
+  const headers: HeadersInit = {
+    Accept: "application/json",
+  };
+  if (apiKey) {
+    headers["X-API-Key"] = apiKey;
   }
 
-  let instance: DuckDBInstance | null = null;
-  let dbConnection: DuckDBConnection | null = null;
-
   try {
-    instance = await DuckDBInstance.create(dbPath, {
-      access_mode: "READ_ONLY",
+    const response = await fetch(upstreamUrl, {
+      method: "GET",
+      headers,
+      cache: "no-store",
     });
-    dbConnection = await instance.connect();
 
-    const reader = await dbConnection.runAndReadAll(`
-      SELECT
-        timestamp,
-        portfolio_value,
-        market_regime,
-        action,
-        target_price,
-        rationale,
-        scalper_intents
-      FROM agent_telemetry
-      ORDER BY timestamp DESC
-      LIMIT 100
-    `);
+    const payload = await response.json();
 
-    const rawRows = reader.getRowObjectsJson();
-    const data: TelemetryRow[] = rawRows.map((row) => ({
-      timestamp: String(row.timestamp ?? ""),
-      portfolio_value: toNullableNumber(row.portfolio_value),
-      market_regime: String(row.market_regime ?? "UNKNOWN"),
-      action: String(row.action ?? "HOLD"),
-      target_price: toNullableNumber(row.target_price),
-      rationale: String(row.rationale ?? ""),
-      scalper_intents: parseScalperIntents(row.scalper_intents),
-    }));
+    if (!response.ok) {
+      return NextResponse.json(
+        {
+          data: [],
+          error:
+            payload?.error ??
+            `Upstream telemetry bridge returned HTTP ${response.status}`,
+        },
+        { status: response.status, headers: { "Cache-Control": "no-store" } }
+      );
+    }
 
     return NextResponse.json(
-      { data },
+      {
+        data: Array.isArray(payload?.data) ? (payload.data as TelemetryRow[]) : [],
+        latest_portfolio_equity: payload?.latest_portfolio_equity ?? null,
+        market_regime: payload?.market_regime ?? "FLAT",
+        latest_sync_timestamp: payload?.latest_sync_timestamp ?? null,
+        sample_count: payload?.sample_count ?? 0,
+        equity_history: Array.isArray(payload?.equity_history)
+          ? payload.equity_history
+          : [],
+      },
       { status: 200, headers: { "Cache-Control": "no-store" } }
     );
   } catch (error) {
     const message =
-      error instanceof Error ? error.message : "Unknown DuckDB error";
-    console.error("[Telemetry API] DuckDB query failed:", message);
+      error instanceof Error ? error.message : "Unknown upstream fetch error";
+    console.error("[Telemetry API] Upstream bridge request failed:", message);
     return NextResponse.json(
-      { data: [], error: `Failed to read telemetry database: ${message}` },
-      { status: 500, headers: { "Cache-Control": "no-store" } }
+      {
+        data: [],
+        error: `Failed to reach telemetry bridge at ${upstreamUrl}: ${message}`,
+      },
+      { status: 502, headers: { "Cache-Control": "no-store" } }
     );
-  } finally {
-    try {
-      dbConnection?.closeSync();
-    } catch {
-      // Ignore cleanup errors on already-closed connections.
-    }
-    try {
-      instance?.closeSync();
-    } catch {
-      // Ignore cleanup errors on already-closed instances.
-    }
   }
 }
