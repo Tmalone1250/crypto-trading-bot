@@ -558,3 +558,95 @@ def test_monitor_trade_and_breakeven_supports_eth_and_sol_symbols() -> None:
         order_id="ord-eth-1",
         stop_price="3000.0",
     )
+
+
+def test_sync_resting_take_profit_cancels_and_replaces_stale_sell_after_dca() -> None:
+    """Verify DCA fill that changes qty/avg_entry cancels stale sell and submits new +1.5% GTC LIMIT_SELL."""
+    from executor_node import sync_resting_take_profit_orders
+
+    state = _build_ready_state(risk_cleared=True)
+    # After DCA fill: qty increased from 2.0 to 4.0, avg_entry dropped from 100.0 to 99.0 (TP = 100.485)
+    state["open_positions"] = [
+        {"symbol": "SOLUSD", "qty": "4.0", "avg_entry_price": "99.0"}
+    ]
+    state["active_orders"] = [
+        {
+            "id": "stale-tp-sell-001",
+            "symbol": "SOL/USD",
+            "side": "sell",
+            "type": "limit",
+            "qty": "2.0",
+            "limit_price": "101.50",
+        }
+    ]
+
+    with (
+        patch("executor_node.cancel_order_by_id", return_value="stale-tp-sell-001") as mock_cancel,
+        patch("executor_node.place_crypto_order", return_value="new-tp-sell-002") as mock_place,
+    ):
+        synced = sync_resting_take_profit_orders(state)
+
+    mock_cancel.assert_called_once_with("stale-tp-sell-001", mcp_client=None)
+    mock_place.assert_called_once()
+    placed_args = mock_place.call_args[0][0]
+    assert placed_args["symbol"] == "SOL/USD"
+    assert placed_args["side"] == "sell"
+    assert placed_args["type"] == "limit"
+    assert placed_args["time_in_force"] == "gtc"
+    assert float(placed_args["qty"]) == pytest.approx(4.0)
+    assert float(placed_args["limit_price"]) == pytest.approx(99.0 * 1.015)
+    assert len(synced) == 1
+    assert synced[0]["cancelled_order_ids"] == ["stale-tp-sell-001"]
+
+
+def test_execution_node_cancels_resting_tp_before_firing_safety_stop_market_sell() -> None:
+    """Verify resting TP LIMIT_SELL is cancelled before executing the -4.0% MARKET_SELL safety stop."""
+    in_mem_conn = duckdb.connect(":memory:")
+    conn_proxy = _PersistentInMemoryConn(in_mem_conn)
+
+    stop_intent = TradeIntent(
+        symbol="SOL/USD",
+        action="MARKET_SELL",
+        target_price=95.50,
+        qty=4.0,
+        notional_usd=382.0,
+        rationale="Grid safety stop-loss triggered (-4.0%)",
+    )
+    state = _build_ready_state(risk_cleared=True)
+    state["trade_intents"] = [stop_intent]
+    state["open_positions"] = [{"symbol": "SOLUSD", "avg_entry_price": "100.0", "qty": "4.0"}]
+    state["active_orders"] = [
+        {
+            "id": "resting-tp-sol-99",
+            "symbol": "SOL/USD",
+            "side": "sell",
+            "type": "limit",
+            "qty": "4.0",
+            "limit_price": "101.50",
+        }
+    ]
+
+    call_order: list[str] = []
+
+    def _record_cancel(oid: str, mcp_client=None) -> str:
+        call_order.append(f"cancel:{oid}")
+        return oid
+
+    def _record_place(details: dict, mcp_client=None) -> str:
+        call_order.append(f"place:{details['type']}:{details['side']}")
+        return "stop-market-sell-id"
+
+    try:
+        with (
+            patch("executor_node.cancel_order_by_id", side_effect=_record_cancel) as mock_cancel,
+            patch("executor_node.place_crypto_order", side_effect=_record_place) as mock_place,
+            patch("executor_node.duckdb.connect", return_value=conn_proxy),
+        ):
+            updated = execution_node(state)
+
+        mock_cancel.assert_called_once_with("resting-tp-sol-99", mcp_client=None)
+        mock_place.assert_called_once()
+        assert call_order == ["cancel:resting-tp-sol-99", "place:market:sell"]
+        assert updated["error_message"] is None
+    finally:
+        in_mem_conn.close()

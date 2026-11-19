@@ -604,3 +604,52 @@ def test_scalper_multi_symbol_crt_isolation_for_eth_and_sol(
     assert intent.action == "LIMIT_BUY"
     assert intent.target_price == pytest.approx(3000.0)
     assert intent.raw_stop_loss == pytest.approx(3000.0 - (100.0 / 1.5))
+
+
+def test_scalper_blocks_5th_dca_tranche_at_max_tranches_cap() -> None:
+    """Verify a 5th DCA tranche is blocked when cost_basis >= MAX_TRANCHES_PER_SYMBOL * $200."""
+    # 4 tranches @ $200 = $800 cost basis (qty=0.266667 @ avg_entry=3000.0).
+    # Price drops -2.5% to 2925.0 (above -4.0% SL at 2880.0) -> must block 5th DCA LIMIT_BUY.
+    df_eth_drop = _make_df([2950.0] * 5, [2920.0] * 5, [2925.0] * 5)
+    state = _base_state(
+        asset_symbols=["ETH/USD"],
+        market_data_by_symbol={"ETH/USD": df_eth_drop},
+        open_positions=[{"symbol": "ETHUSD", "avg_entry_price": "3000.0", "qty": "0.266667"}],
+    )
+    updated = scalper_expert_node(state)
+    assert updated["trade_intents"] == []
+    assert updated["action"] == "HOLD"
+
+
+def test_scalper_blocks_duplicate_open_limit_buy_orders() -> None:
+    """Verify duplicate DCA LIMIT_BUY is blocked when an open buy order already exists."""
+    df_eth_drop = _make_df([2950.0] * 5, [2920.0] * 5, [2925.0] * 5)
+    state = _base_state(
+        asset_symbols=["ETH/USD"],
+        market_data_by_symbol={"ETH/USD": df_eth_drop},
+        open_positions=[{"symbol": "ETHUSD", "avg_entry_price": "3000.0", "qty": "0.066667"}],
+    )
+    state["active_orders"] = [
+        {"id": "ord-buy-1", "symbol": "ETH/USD", "side": "buy", "type": "limit", "qty": "0.068"}
+    ]
+    updated = scalper_expert_node(state)
+    assert updated["trade_intents"] == []
+    assert updated["action"] == "HOLD"
+
+
+def test_scalper_triggers_4_percent_safety_stop_loss_market_sell() -> None:
+    """Verify -4.0% drop from avg_entry_price emits MARKET_SELL with safety stop rationale."""
+    # avg_entry = 100.0 -> price 95.50 (-4.5% <= -4.0%) triggers MARKET_SELL
+    df_sol_crash = _make_df([97.0] * 5, [95.0] * 5, [95.50] * 5)
+    state = _base_state(
+        asset_symbols=["SOL/USD"],
+        market_data_by_symbol={"SOL/USD": df_sol_crash},
+        open_positions=[{"symbol": "SOLUSD", "avg_entry_price": "100.0", "qty": "4.0"}],
+    )
+    updated = scalper_expert_node(state)
+    assert len(updated["trade_intents"]) == 1
+    intent = updated["trade_intents"][0]
+    assert intent.symbol == "SOL/USD"
+    assert intent.action == "MARKET_SELL"
+    assert intent.qty == pytest.approx(4.0)
+    assert intent.rationale == "Grid safety stop-loss triggered (-4.0%)"

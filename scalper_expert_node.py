@@ -19,6 +19,11 @@ import uuid
 import duckdb
 import pandas as pd
 
+from config import (
+    GRID_STOP_LOSS_PCT,
+    GRID_TRANCHE_NOTIONAL,
+    MAX_TRANCHES_PER_SYMBOL,
+)
 from state import AgentState, TradeIntent
 
 DB_PATH: str = "agent_trades.duckdb"
@@ -30,9 +35,38 @@ DISPLACEMENT_THRESHOLD_PCT: float = 0.0020  # 0.20% minimum deviation from Fair 
 DEFAULT_SCALP_SYMBOLS: tuple[str, ...] = ("BTC/USD", "ETH/USD", "SOL/USD")
 FEE_ADJUSTED_PROFIT_MULTIPLIER: float = 1.015  # +1.5% gross target to clear 0.30% maker fees
 TRANCHE_GRID_DROP_MULTIPLIER: float = 0.98     # -2.0% below avg_entry_price for next tranche
-TRANCHE_NOTIONAL_USD: float = 200.0
+TRANCHE_NOTIONAL_USD: float = GRID_TRANCHE_NOTIONAL
+TRANCHE_CAP_TOLERANCE: float = 0.95
+TP_DRIFT_TOLERANCE_PCT: float = 0.0010         # 0.10% price shift threshold for resting TP sync
 LOWER_RANGE_PCT: float = 0.20
 QTY_PRECISION: int = 6
+
+
+def _get_open_orders_for_symbol(
+    state: AgentState,
+    symbol: str,
+    side: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return open/active orders matching ``symbol`` (and optional ``side``)."""
+    target_sym = symbol.replace("/", "").upper()
+    raw_orders = list(state.get("open_orders") or []) + list(state.get("active_orders") or [])  # type: ignore[arg-type]
+    matched: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for order in raw_orders:
+        if not isinstance(order, dict):
+            continue
+        oid = str(order.get("id", ""))
+        if oid and oid in seen_ids:
+            continue
+        ord_sym = str(order.get("symbol", "")).replace("/", "").upper()
+        if ord_sym != target_sym:
+            continue
+        if side is not None and str(order.get("side", "")).lower() != side.lower():
+            continue
+        if oid:
+            seen_ids.add(oid)
+        matched.append(order)
+    return matched
 
 
 def _find_open_position(state: AgentState, symbol: str) -> dict[str, Any] | None:
@@ -87,6 +121,26 @@ def _evaluate_symbol_intent(
         except (TypeError, ValueError):
             held_qty = 0.0
 
+        # 0. Software Safety Stop-Loss: <= -4.0% below avg_entry_price.
+        if avg_entry > 0.0 and current_price <= avg_entry * (1.0 - GRID_STOP_LOSS_PCT):
+            sell_qty = (
+                held_qty
+                if held_qty > 0.0
+                else round(TRANCHE_NOTIONAL_USD / current_price, QTY_PRECISION)
+            )
+            print(
+                f"[Scalper] {symbol} Grid safety stop-loss triggered (-4.0%): "
+                f"price=${current_price:.2f} <= ${avg_entry * (1.0 - GRID_STOP_LOSS_PCT):.2f}"
+            )
+            return TradeIntent(
+                symbol=symbol,
+                action="MARKET_SELL",
+                target_price=current_price,
+                qty=round(sell_qty, QTY_PRECISION),
+                notional_usd=round(sell_qty * current_price, 2),
+                rationale="Grid safety stop-loss triggered (-4.0%)",
+            )
+
         # 1. Fee-Adjusted Take-Profit: >= +1.5% above avg_entry_price.
         if avg_entry > 0.0 and current_price >= avg_entry * FEE_ADJUSTED_PROFIT_MULTIPLIER:
             sell_qty = held_qty if held_qty > 0.0 else round(TRANCHE_NOTIONAL_USD / current_price, QTY_PRECISION)
@@ -104,8 +158,58 @@ def _evaluate_symbol_intent(
                 rationale=rationale,
             )
 
+        # 1b. Resting +1.5% GTC Take-Profit Sync when an existing open sell order is stale.
+        open_sells = _get_open_orders_for_symbol(state, symbol, side="sell")
+        if avg_entry > 0.0 and held_qty > 0.0 and open_sells:
+            tp_target = round(avg_entry * FEE_ADJUSTED_PROFIT_MULTIPLIER, 6)
+            existing_sell = open_sells[0]
+            try:
+                existing_qty = float(existing_sell.get("qty", 0.0))
+            except (TypeError, ValueError):
+                existing_qty = 0.0
+            try:
+                existing_limit = float(existing_sell.get("limit_price", 0.0))
+            except (TypeError, ValueError):
+                existing_limit = 0.0
+
+            qty_drifted = abs(existing_qty - held_qty) > 1e-6
+            price_drifted = (
+                existing_limit <= 0.0
+                or (abs(existing_limit - tp_target) / tp_target) > TP_DRIFT_TOLERANCE_PCT
+            )
+            if qty_drifted or price_drifted:
+                rationale = (
+                    f"Resting +1.5% GTC TP sync on {symbol}: replacing stale sell "
+                    f"(qty={existing_qty}->{held_qty}, tp=${existing_limit:.2f}->${tp_target:.2f})."
+                )
+                print(f"[Scalper] {rationale}")
+                return TradeIntent(
+                    symbol=symbol,
+                    action="LIMIT_SELL",
+                    target_price=tp_target,
+                    qty=round(held_qty, QTY_PRECISION),
+                    notional_usd=round(held_qty * tp_target, 2),
+                    rationale=rationale,
+                )
+
         # 2. Multi-Tranche Grid: allow additional $200 LIMIT_BUY only if down >= 2% from avg_entry.
         if avg_entry > 0.0 and current_price <= avg_entry * TRANCHE_GRID_DROP_MULTIPLIER:
+            cost_basis = held_qty * avg_entry
+            max_cost_basis = MAX_TRANCHES_PER_SYMBOL * GRID_TRANCHE_NOTIONAL * TRANCHE_CAP_TOLERANCE
+            if cost_basis >= max_cost_basis:
+                print(
+                    f"[Scalper] {symbol} DCA buy blocked: cost_basis=${cost_basis:.2f} "
+                    f"reached max {MAX_TRANCHES_PER_SYMBOL} tranches (${MAX_TRANCHES_PER_SYMBOL * GRID_TRANCHE_NOTIONAL:.2f})."
+                )
+                return None
+
+            open_buys = _get_open_orders_for_symbol(state, symbol, side="buy")
+            if open_buys:
+                print(
+                    f"[Scalper] {symbol} DCA buy blocked: {len(open_buys)} open buy order(s) already resting."
+                )
+                return None
+
             buy_qty = round(TRANCHE_NOTIONAL_USD / current_price, QTY_PRECISION)
             drop_pct = ((current_price - avg_entry) / avg_entry) * 100.0
             rationale = (
@@ -125,6 +229,8 @@ def _evaluate_symbol_intent(
         return None
 
     # 3. Flat / No Open Position: enter $200 tranche if in lower 20% of 5-bar range.
+    if _get_open_orders_for_symbol(state, symbol, side="buy"):
+        return None
     recent_5 = df.tail(5)
     five_bar_high = float(recent_5["high"].max())
     five_bar_low = float(recent_5["low"].min())

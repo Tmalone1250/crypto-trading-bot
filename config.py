@@ -8,6 +8,9 @@ load_dotenv()
 
 ALPACA_PAPER_URL: str = "https://paper-api.alpaca.markets"
 ALPACA_DATA_URL: str = "https://data.alpaca.markets"
+MAX_TRANCHES_PER_SYMBOL: int = 4
+GRID_TRANCHE_NOTIONAL: float = 200.0
+GRID_STOP_LOSS_PCT: float = 0.04
 
 
 def get_alpaca_paper_config() -> dict[str, Any]:

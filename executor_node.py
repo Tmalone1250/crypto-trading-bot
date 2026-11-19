@@ -167,6 +167,148 @@ def cancel_orders(mcp_client: Any | None = None) -> str:
     return cancel_all_orders(mcp_client=mcp_client)
 
 
+async def _cancel_order_by_id_mcp(order_id: str) -> str:
+    """Open an MCP stdio session to ``alpaca-mcp-server`` and invoke ``cancel_order_by_id``."""
+    server_params = _build_server_params()
+    async with stdio_client(server_params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                "cancel_order_by_id",
+                arguments={"order_id": str(order_id)},
+            )
+            return str(_extract_order_id(result))
+
+
+def cancel_order_by_id(order_id: str, mcp_client: Any | None = None) -> str:
+    """Cancel a specific open order by ``order_id`` via Alpaca MCP or SDK."""
+    if mcp_client is not None:
+        if hasattr(mcp_client, "cancel_order_by_id"):
+            res = mcp_client.cancel_order_by_id(str(order_id))
+            return str(getattr(res, "id", order_id))
+        result = mcp_client.call_tool(
+            "cancel_order_by_id",
+            arguments={"order_id": str(order_id)},
+        )
+        return str(_extract_order_id(result))
+    return str(asyncio.run(_cancel_order_by_id_mcp(str(order_id))))
+
+
+def cancel_open_sell_orders_for_symbol(
+    state: AgentState,
+    symbol: str,
+    mcp_client: Any | None = None,
+) -> list[str]:
+    """Cancel all resting open sell orders for ``symbol`` to unlock crypto balances."""
+    target_sym = symbol.replace("/", "").upper()
+    raw_orders = list(state.get("open_orders") or []) + list(state.get("active_orders") or [])  # type: ignore[arg-type]
+    cancelled_ids: list[str] = []
+    seen_ids: set[str] = set()
+
+    for order in raw_orders:
+        if not isinstance(order, dict):
+            continue
+        ord_sym = str(order.get("symbol", "")).replace("/", "").upper()
+        ord_side = str(order.get("side", "")).lower()
+        if ord_sym != target_sym or ord_side != "sell":
+            continue
+        oid = str(order.get("id", ""))
+        if not oid or oid in seen_ids:
+            continue
+        seen_ids.add(oid)
+        cancel_order_by_id(oid, mcp_client=mcp_client)
+        cancelled_ids.append(oid)
+        print(f"[Executor] Cancelled resting sell order {oid} for {symbol} to unlock balance.")
+
+    return cancelled_ids
+
+
+def sync_resting_take_profit_orders(
+    state: AgentState,
+    mcp_client: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Ensure every open position has an up-to-date resting +1.5% GTC LIMIT_SELL order."""
+    positions = state.get("open_positions") or []
+    raw_orders = list(state.get("open_orders") or []) + list(state.get("active_orders") or [])  # type: ignore[arg-type]
+    synced: list[dict[str, Any]] = []
+
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        raw_sym = str(pos.get("symbol", "")).upper()
+        if not raw_sym:
+            continue
+        symbol = raw_sym if "/" in raw_sym else f"{raw_sym[:-3]}/{raw_sym[-3:]}"
+        target_norm = symbol.replace("/", "").upper()
+
+        try:
+            held_qty = float(pos.get("qty", 0.0))
+            avg_entry = float(pos.get("avg_entry_price", 0.0))
+        except (TypeError, ValueError):
+            continue
+
+        if held_qty <= 0.0 or avg_entry <= 0.0:
+            continue
+
+        tp_price = round(avg_entry * 1.015, 6)
+        matching_sells = [
+            o
+            for o in raw_orders
+            if isinstance(o, dict)
+            and str(o.get("symbol", "")).replace("/", "").upper() == target_norm
+            and str(o.get("side", "")).lower() == "sell"
+        ]
+
+        needs_replace = True
+        if len(matching_sells) == 1:
+            existing = matching_sells[0]
+            try:
+                ex_qty = float(existing.get("qty", 0.0))
+                ex_price = float(existing.get("limit_price", 0.0))
+                qty_ok = abs(ex_qty - held_qty) <= 1e-6
+                price_ok = ex_price > 0.0 and (abs(ex_price - tp_price) / tp_price) <= 0.001
+                if qty_ok and price_ok:
+                    needs_replace = False
+            except (TypeError, ValueError):
+                needs_replace = True
+
+        if needs_replace:
+            cancelled = cancel_open_sell_orders_for_symbol(state, symbol, mcp_client=mcp_client)
+            tp_details: dict[str, Any] = {
+                "symbol": symbol,
+                "side": "sell",
+                "type": "limit",
+                "order_type": "limit",
+                "time_in_force": "gtc",
+                "qty": str(round(held_qty, 6)),
+                "limit_price": str(tp_price),
+                "position_size": round(held_qty, 6),
+                "stop_loss_price": 0.0,
+                "target_price": tp_price,
+                "dry_run": _is_dry_run(),
+            }
+            trade_id = (
+                place_crypto_order(tp_details, mcp_client=mcp_client)
+                if mcp_client is not None
+                else place_crypto_order(tp_details)
+            )
+            print(
+                f"[Executor] Synced resting +1.5% GTC TP LIMIT_SELL for {symbol}: "
+                f"qty={held_qty} @ ${tp_price:.2f} (trade_id={trade_id}, cancelled={cancelled})"
+            )
+            synced.append(
+                {
+                    "symbol": symbol,
+                    "qty": round(held_qty, 6),
+                    "target_price": tp_price,
+                    "trade_id": trade_id,
+                    "cancelled_order_ids": cancelled,
+                }
+            )
+
+    return synced
+
+
 def place_crypto_order(
     order_details: dict[str, Any],
     mcp_client: Any | None = None,
@@ -381,6 +523,12 @@ def execution_node(state: AgentState) -> AgentState:
 
             for intent in trade_intents:
                 intent_sym, intent_act, intent_qty, intent_details = _intent_to_order_details(intent)
+                if intent_act in {"LIMIT_SELL", "MARKET_SELL"}:
+                    cancel_open_sell_orders_for_symbol(
+                        state=state,
+                        symbol=intent_sym,
+                        mcp_client=mcp_client,
+                    )
                 trade_id = (
                     place_crypto_order(intent_details, mcp_client=mcp_client)
                     if mcp_client is not None
@@ -481,6 +629,13 @@ def execution_node(state: AgentState) -> AgentState:
             order_details.setdefault("side", "buy")
             if order_details.get("limit_price") is not None:
                 order_details["limit_price"] = str(order_details["limit_price"])
+
+        if action in {"LIMIT_SELL", "MARKET_SELL"}:
+            cancel_open_sell_orders_for_symbol(
+                state=state,
+                symbol=symbol,
+                mcp_client=mcp_client,
+            )
 
         trade_id = (
             place_crypto_order(order_details, mcp_client=mcp_client)
