@@ -57,6 +57,11 @@ DEFAULT_WATCHED_ASSETS: dict[str, float | None] = {
     "ETH/USD": None,
     "SOL/USD": None,
 }
+DEFAULT_ASSET_PHASES: dict[str, str] = {
+    "BTC/USD": "HOLD",
+    "ETH/USD": "HOLD",
+    "SOL/USD": "HOLD",
+}
 
 
 def _parse_watched_assets(raw: Any) -> dict[str, float | None]:
@@ -74,6 +79,34 @@ def _parse_watched_assets(raw: Any) -> dict[str, float | None]:
     return dict(DEFAULT_WATCHED_ASSETS)
 
 
+def _parse_open_positions(raw: Any) -> list[dict[str, Any]]:
+    """Safely parse ``open_positions`` JSON string into a list of position dicts."""
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def _parse_asset_phases(raw: Any) -> dict[str, str]:
+    """Safely parse ``asset_phases`` JSON string into a ``symbol -> phase`` dict."""
+    if isinstance(raw, dict) and raw:
+        return {str(k): str(v or "HOLD") for k, v in raw.items()}
+    if not isinstance(raw, str) or not raw.strip():
+        return dict(DEFAULT_ASSET_PHASES)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and parsed:
+            return {str(k): str(v or "HOLD") for k, v in parsed.items()}
+    except json.JSONDecodeError:
+        pass
+    return dict(DEFAULT_ASSET_PHASES)
+
+
 def query_telemetry_payload(db_path: str = DB_PATH, limit: int = 100) -> dict[str, Any]:
     """Query ``agent_telemetry`` from DuckDB and format JSON payload for the dashboard."""
     conn = duckdb.connect(db_path)
@@ -88,16 +121,21 @@ def query_telemetry_payload(db_path: str = DB_PATH, limit: int = 100) -> dict[st
                 target_price DOUBLE,
                 rationale VARCHAR,
                 scalper_intents VARCHAR,
-                watched_assets VARCHAR
+                watched_assets VARCHAR,
+                open_positions VARCHAR,
+                asset_phases VARCHAR
             )
             """
         )
-        conn.execute(
-            "ALTER TABLE agent_telemetry ADD COLUMN IF NOT EXISTS scalper_intents VARCHAR"
-        )
-        conn.execute(
-            "ALTER TABLE agent_telemetry ADD COLUMN IF NOT EXISTS watched_assets VARCHAR"
-        )
+        for col_name in (
+            "scalper_intents",
+            "watched_assets",
+            "open_positions",
+            "asset_phases",
+        ):
+            conn.execute(
+                f"ALTER TABLE agent_telemetry ADD COLUMN IF NOT EXISTS {col_name} VARCHAR"
+            )
         raw_rows = conn.execute(
             """
             SELECT
@@ -108,7 +146,9 @@ def query_telemetry_payload(db_path: str = DB_PATH, limit: int = 100) -> dict[st
                 target_price,
                 rationale,
                 scalper_intents,
-                watched_assets
+                watched_assets,
+                open_positions,
+                asset_phases
             FROM agent_telemetry
             ORDER BY timestamp DESC
             LIMIT ?
@@ -130,6 +170,8 @@ def query_telemetry_payload(db_path: str = DB_PATH, limit: int = 100) -> dict[st
                 "rationale": str(row[5] or ""),
                 "scalper_intents": _parse_scalper_intents(row[6]),
                 "watched_assets": _parse_watched_assets(row[7]),
+                "open_positions": _parse_open_positions(row[8]),
+                "asset_phases": _parse_asset_phases(row[9]),
             }
         )
 
@@ -147,6 +189,10 @@ def query_telemetry_payload(db_path: str = DB_PATH, limit: int = 100) -> dict[st
         "data": rows,
         "watched_assets": (
             latest["watched_assets"] if latest else dict(DEFAULT_WATCHED_ASSETS)
+        ),
+        "open_positions": latest["open_positions"] if latest else [],
+        "asset_phases": (
+            latest["asset_phases"] if latest else dict(DEFAULT_ASSET_PHASES)
         ),
         "latest_portfolio_equity": latest["portfolio_value"] if latest else None,
         "market_regime": latest["market_regime"] if latest else "FLAT",

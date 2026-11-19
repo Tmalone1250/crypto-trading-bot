@@ -9,6 +9,13 @@ export interface ScalperIntent {
   rationale?: string;
 }
 
+export interface OpenPosition {
+  symbol: string;
+  qty: number | null;
+  avg_entry_price: number | null;
+  unrealized_pl: number | null;
+}
+
 export interface TelemetryRow {
   timestamp: string;
   portfolio_value: number | null;
@@ -18,6 +25,8 @@ export interface TelemetryRow {
   rationale: string;
   scalper_intents: ScalperIntent[];
   watched_assets?: Record<string, number | null>;
+  open_positions?: OpenPosition[];
+  asset_phases?: Record<string, string>;
 }
 
 export async function GET() {
@@ -62,6 +71,14 @@ export async function GET() {
           "BTC/USD": null,
           "ETH/USD": null,
           "SOL/USD": null,
+        },
+        open_positions: Array.isArray(payload?.open_positions)
+          ? (payload.open_positions as OpenPosition[])
+          : [],
+        asset_phases: payload?.asset_phases ?? {
+          "BTC/USD": "HOLD",
+          "ETH/USD": "HOLD",
+          "SOL/USD": "HOLD",
         },
         latest_portfolio_equity: payload?.latest_portfolio_equity ?? null,
         market_regime: payload?.market_regime ?? "FLAT",

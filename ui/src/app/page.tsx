@@ -28,6 +28,13 @@ interface ScalperIntent {
   rationale?: string;
 }
 
+interface OpenPosition {
+  symbol: string;
+  qty: number | null;
+  avg_entry_price: number | null;
+  unrealized_pl: number | null;
+}
+
 interface TelemetryRow {
   timestamp: string;
   portfolio_value: number | null;
@@ -37,11 +44,15 @@ interface TelemetryRow {
   rationale: string;
   scalper_intents: ScalperIntent[];
   watched_assets?: Record<string, number | null>;
+  open_positions?: OpenPosition[];
+  asset_phases?: Record<string, string>;
 }
 
 interface TelemetryApiResponse {
   data?: TelemetryRow[];
   watched_assets?: Record<string, number | null>;
+  open_positions?: OpenPosition[];
+  asset_phases?: Record<string, string>;
   error?: string;
   warning?: string;
 }
@@ -50,6 +61,12 @@ const DEFAULT_WATCHLIST: Record<string, number | null> = {
   "BTC/USD": null,
   "ETH/USD": null,
   "SOL/USD": null,
+};
+
+const DEFAULT_PHASES: Record<string, string> = {
+  "BTC/USD": "HOLD",
+  "ETH/USD": "HOLD",
+  "SOL/USD": "HOLD",
 };
 
 interface ChartPoint {
@@ -105,6 +122,9 @@ export default function CommandCenterPage() {
   const [rows, setRows] = useState<TelemetryRow[]>([]);
   const [watchedAssets, setWatchedAssets] =
     useState<Record<string, number | null>>(DEFAULT_WATCHLIST);
+  const [openPositions, setOpenPositions] = useState<OpenPosition[]>([]);
+  const [assetPhases, setAssetPhases] =
+    useState<Record<string, string>>(DEFAULT_PHASES);
   const [lastSync, setLastSync] = useState<string>("--");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
@@ -132,6 +152,15 @@ export default function CommandCenterPage() {
             nextRows[0]?.watched_assets ??
             DEFAULT_WATCHLIST;
           setWatchedAssets(nextWatched);
+          const nextPositions = Array.isArray(payload.open_positions)
+            ? payload.open_positions
+            : nextRows[0]?.open_positions ?? [];
+          setOpenPositions(nextPositions);
+          const nextPhases =
+            payload.asset_phases ??
+            nextRows[0]?.asset_phases ??
+            DEFAULT_PHASES;
+          setAssetPhases(nextPhases);
           setLastSync(
             new Date().toLocaleTimeString([], {
               hour: "2-digit",
@@ -244,26 +273,98 @@ export default function CommandCenterPage() {
           </div>
         </header>
 
-        {/* Active Watchlist Strip */}
-        <div className="flex flex-wrap items-center justify-between gap-3 border border-neutral-800 bg-neutral-950 px-5 py-3">
-          <div className="flex items-center gap-2">
-            <span className="h-2 w-2 bg-orange-500" />
-            <span className="font-mono text-xs font-bold uppercase tracking-widest text-neutral-300">
-              Active Watchlist
-            </span>
-          </div>
-          <div className="flex flex-wrap items-center gap-3">
-            {Object.entries(watchedAssets).map(([symbol, price]) => (
+        {/* Live Asset Watchlist Cards */}
+        <section className="grid gap-4 sm:grid-cols-3">
+          {Object.entries(watchedAssets).map(([symbol, price]) => {
+            const normSym = symbol.replace("/", "").toUpperCase();
+            const activePos = openPositions.find(
+              (pos) =>
+                (pos.symbol || "").replace("/", "").toUpperCase() === normSym
+            );
+            const phase = assetPhases[symbol] ?? "HOLD";
+            const isPhaseActive = phase !== "HOLD";
+            const upl = activePos?.unrealized_pl ?? 0;
+
+            return (
               <div
                 key={symbol}
-                className="inline-flex items-center gap-2 border border-neutral-800 bg-black px-3 py-1 font-mono text-xs"
+                className="flex flex-col justify-between gap-3 border border-neutral-800 bg-neutral-950 p-4 font-mono"
               >
-                <span className="font-bold text-orange-500">{symbol}</span>
-                <span className="text-white">{formatCurrency(price)}</span>
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-bold text-white">
+                        {symbol}
+                      </span>
+                      <span
+                        className={
+                          activePos
+                            ? "bg-orange-500 px-1.5 py-0.5 text-[10px] font-extrabold uppercase text-black"
+                            : "border border-neutral-700 bg-black px-1.5 py-0.5 text-[10px] font-bold uppercase text-neutral-400"
+                        }
+                      >
+                        {activePos ? "ACTIVE POSITION" : "MONITORING"}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-lg font-bold text-orange-500">
+                      {formatCurrency(price)}
+                    </div>
+                  </div>
+
+                  <span
+                    className={
+                      isPhaseActive
+                        ? "border border-orange-500/80 bg-black px-2 py-0.5 text-[10px] font-bold uppercase text-orange-400"
+                        : "border border-neutral-800 bg-black px-2 py-0.5 text-[10px] uppercase text-neutral-400"
+                    }
+                  >
+                    {phase}
+                  </span>
+                </div>
+
+                {activePos ? (
+                  <div className="grid grid-cols-3 gap-2 border-t border-neutral-800 pt-2 text-[11px]">
+                    <div>
+                      <div className="text-[9px] uppercase text-neutral-500">
+                        QTY
+                      </div>
+                      <div className="text-white">{activePos.qty ?? "--"}</div>
+                    </div>
+                    <div>
+                      <div className="text-[9px] uppercase text-neutral-500">
+                        AVG ENTRY
+                      </div>
+                      <div className="text-white">
+                        {formatCurrency(activePos.avg_entry_price)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[9px] uppercase text-neutral-500">
+                        UNREALIZED PNL
+                      </div>
+                      <div
+                        className={
+                          upl > 0
+                            ? "font-bold text-emerald-400"
+                            : upl < 0
+                            ? "font-bold text-red-400"
+                            : "text-neutral-300"
+                        }
+                      >
+                        {upl > 0 ? "+" : ""}
+                        {formatCurrency(activePos.unrealized_pl)}
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="border-t border-neutral-800 pt-2 text-[11px] text-neutral-500">
+                    FLAT // SCANNING 1H, 15M &amp; 1M STRUCTURE
+                  </div>
+                )}
               </div>
-            ))}
-          </div>
-        </div>
+            );
+          })}
+        </section>
 
         {errorMessage && (
           <div className="border border-orange-500 bg-neutral-950 px-4 py-3 font-mono text-xs text-orange-400">
@@ -307,6 +408,7 @@ export default function CommandCenterPage() {
                     stroke="#737373"
                     tick={{ fill: "#a3a3a3", fontSize: 11, fontFamily: "monospace" }}
                     tickLine={false}
+                    minTickGap={40}
                   />
                   <YAxis
                     stroke="#737373"

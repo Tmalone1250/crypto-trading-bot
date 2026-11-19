@@ -110,9 +110,13 @@ def _anchor_fair_price_setup(
     session_name: str,
     fair_price: float,
     now_naive: datetime,
+    symbol: str = "BTC/USD",
 ) -> str:
-    """Insert a ``PHASE_0_ANCHORED`` Fair Price Reversion row into ``setup_state_machine``."""
-    setup_id = f"{session_name}-{now_naive.strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+    """Insert a symbol-namespaced ``PHASE_0_ANCHORED`` row into ``setup_state_machine``."""
+    setup_id = (
+        f"session_open:{symbol}:{session_name}-"
+        f"{now_naive.strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+    )
     conn.execute(
         """
         INSERT INTO setup_state_machine (
@@ -130,18 +134,35 @@ def _anchor_fair_price_setup(
     return setup_id
 
 
-def _extract_opening_price(state: AgentState) -> float:
-    """Resolve the exact session opening price from state or latest candle."""
-    current_price = float(state.get("current_price", 0.0))
-    if current_price > 0.0:
-        return current_price
+def _extract_opening_price(state: AgentState, symbol: str | None = None) -> float:
+    """Resolve the exact session opening price for ``symbol`` from state or latest candle."""
+    primary_sym = str(state.get("asset_symbol", "BTC/USD"))
+    target_sym = symbol or primary_sym
+    market_map = state.get("market_data_by_symbol") or {}
 
-    df = state.get("historical_data")
-    if df is not None and not df.empty:
-        if "open" in df.columns:
-            return float(df["open"].iloc[-1])
-        if "close" in df.columns:
-            return float(df["close"].iloc[-1])
+    for key in (f"{target_sym}_1M", target_sym, target_sym.replace("/", "")):
+        sym_df = market_map.get(key)
+        if sym_df is not None and hasattr(sym_df, "empty") and not sym_df.empty:
+            if "close" in sym_df.columns:
+                val = float(sym_df["close"].iloc[-1])
+                if val > 0.0:
+                    return val
+            if "open" in sym_df.columns:
+                val = float(sym_df["open"].iloc[-1])
+                if val > 0.0:
+                    return val
+
+    if target_sym == primary_sym:
+        current_price = float(state.get("current_price", 0.0))
+        if current_price > 0.0:
+            return current_price
+
+        df = state.get("historical_data")
+        if df is not None and not df.empty:
+            if "open" in df.columns:
+                return float(df["open"].iloc[-1])
+            if "close" in df.columns:
+                return float(df["close"].iloc[-1])
     return 0.0
 
 
@@ -187,26 +208,33 @@ def supervisor_node(state: AgentState, now: datetime | None = None) -> AgentStat
                 }
 
             if session_open is not None:
-                opening_price = _extract_opening_price(state)
-                if opening_price > 0.0:
-                    setup_id = _anchor_fair_price_setup(
-                        conn=conn,
-                        session_name=session_open,
-                        fair_price=opening_price,
-                        now_naive=now_naive,
-                    )
+                symbols = list(
+                    state.get("asset_symbols") or [state.get("asset_symbol", "BTC/USD")]
+                )
+                anchored_summaries: list[str] = []
+                for sym in symbols:
+                    opening_price = _extract_opening_price(state, symbol=sym)
+                    if opening_price > 0.0:
+                        setup_id = _anchor_fair_price_setup(
+                            conn=conn,
+                            session_name=session_open,
+                            fair_price=opening_price,
+                            now_naive=now_naive,
+                            symbol=sym,
+                        )
+                        anchored_summaries.append(f"{sym}@${opening_price:.2f} ({setup_id})")
+
+                if anchored_summaries:
+                    summary_text = ", ".join(anchored_summaries)
                     print(
                         f"[Supervisor] {session_open} Open Detected | "
-                        f"Anchored Fair Price ${opening_price:.2f} ({setup_id}) | "
+                        f"Anchored Fair Prices: {summary_text} | "
                         "Regime: SESSION_OPEN_WATCH"
                     )
                     return {
                         **state,
                         "market_regime": "SESSION_OPEN_WATCH",
-                        "rationale": (
-                            f"{session_open} open anchored Fair Price ${opening_price:.2f} "
-                            f"({setup_id})."
-                        ),
+                        "rationale": f"{session_open} open anchored Fair Prices: {summary_text}.",
                     }
 
             if has_active_setup:

@@ -150,67 +150,142 @@ def _evaluate_symbol_intent(
     return None
 
 
-def _evaluate_session_open_reversion(state: AgentState) -> AgentState:
-    """Execute J.J. Simon Fair Price Reversion Phase 1/2 state machine in ``SESSION_OPEN_WATCH``."""
-    symbol = state.get("asset_symbol", "BTC/USD")
-    df = _get_symbol_dataframe(state, symbol)
-    if df is None or df.empty or not {"open", "high", "low", "close"}.issubset(df.columns):
-        return {
-            **state,
-            "trade_intents": [],
-            "action": "HOLD",
-            "target_price": None,
-            "rationale": "Session Open Watch: waiting for valid 1m OHLCV candles.",
-        }
+def _get_exec_1m_dataframe(state: AgentState, symbol: str) -> pd.DataFrame | None:
+    """Resolve the 1-minute execution DataFrame (``{symbol}_1M``) or fall back to ``{symbol}``."""
+    market_map = state.get("market_data_by_symbol") or {}
+    for key in (f"{symbol}_1M", f"{symbol}:1M"):
+        df_1m = market_map.get(key)
+        if df_1m is not None and not df_1m.empty:
+            return df_1m
+    return _get_symbol_dataframe(state, symbol)
 
-    current_price = float(state.get("current_price", 0.0))
+
+def _resolve_symbol_price(
+    state: AgentState,
+    symbol: str,
+    df: pd.DataFrame | None,
+) -> float:
+    """Resolve the latest execution price for ``symbol``."""
+    primary_sym = str(state.get("asset_symbol", "BTC/USD"))
+    if symbol == primary_sym and float(state.get("current_price", 0.0)) > 0.0:
+        return float(state["current_price"])
+    if df is not None and not df.empty and "close" in df.columns:
+        return float(df["close"].iloc[-1])
+    return 0.0
+
+
+def _fetch_symbol_setup(
+    conn: duckdb.DuckDBPyConnection,
+    strategy: str,
+    phases: tuple[str, ...],
+    symbol: str,
+    primary_symbol: str,
+) -> tuple[Any, ...] | None:
+    """Fetch the latest active setup row for ``(strategy, symbol)`` from ``setup_state_machine``."""
+    placeholders = ", ".join("?" for _ in phases)
+    query = f"""
+        SELECT setup_id, phase, sweep_low, target_price
+        FROM setup_state_machine
+        WHERE strategy = ?
+          AND phase IN ({placeholders})
+          AND (
+              setup_id LIKE ?
+              OR setup_id LIKE ?
+              OR (? = ? AND setup_id NOT LIKE '%:%')
+          )
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """
+    params: list[Any] = [
+        strategy,
+        *phases,
+        f"%:{symbol}:%",
+        f"%:{symbol}",
+        symbol,
+        primary_symbol,
+    ]
+    return conn.execute(query, params).fetchone()
+
+
+def _summarize_active_symbol_phases(symbols: list[str], primary_symbol: str) -> str | None:
+    """Build a compact multi-symbol phase summary (e.g., ``BTC: PHASE_1 | ETH: HOLD``)."""
+    conn = duckdb.connect(DB_PATH)
+    try:
+        _ensure_setup_table(conn)
+        parts: list[str] = []
+        any_active = False
+        active_phases = (
+            "PHASE_0_ANCHORED",
+            "PHASE_1_DISPLACED",
+            "PHASE_1_SWEPT",
+            "PHASE_2_FIRST_BREAK",
+            "PHASE_3_PULLBACK",
+            "PHASE_1_POI_TAPPED",
+            "PHASE_2_CHOCH",
+            "PHASE_1_LVN_IDENTIFIED",
+            "PHASE_2_ABSORPTION",
+        )
+        placeholders = ", ".join("?" for _ in active_phases)
+        for sym in symbols:
+            short = sym.split("/")[0]
+            row = conn.execute(
+                f"""
+                SELECT phase
+                FROM setup_state_machine
+                WHERE phase IN ({placeholders})
+                  AND (
+                      setup_id LIKE ?
+                      OR setup_id LIKE ?
+                      OR (? = ? AND setup_id NOT LIKE '%:%')
+                  )
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                [*active_phases, f"%:{sym}:%", f"%:{sym}", sym, primary_symbol],
+            ).fetchone()
+            if row is not None and row[0]:
+                any_active = True
+                parts.append(f"{short}: {row[0]}")
+            else:
+                parts.append(f"{short}: HOLD")
+        return " | ".join(parts) if any_active else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def _evaluate_session_open_reversion_for_symbol(
+    state: AgentState,
+    symbol: str,
+) -> tuple[TradeIntent | None, str]:
+    """Evaluate J.J. Simon Fair Price Reversion Phase 1/2 for a single ``symbol``."""
+    primary_sym = str(state.get("asset_symbol", "BTC/USD"))
+    df = _get_exec_1m_dataframe(state, symbol)
+    if df is None or df.empty or not {"open", "high", "low", "close"}.issubset(df.columns):
+        return None, f"{symbol.split('/')[0]}: HOLD"
+
+    current_price = _resolve_symbol_price(state, symbol, df)
     if current_price <= 0.0:
-        current_price = float(df["close"].iloc[-1])
+        return None, f"{symbol.split('/')[0]}: HOLD"
 
     conn = duckdb.connect(DB_PATH)
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS setup_state_machine (
-                setup_id VARCHAR PRIMARY KEY,
-                strategy VARCHAR NOT NULL,
-                phase VARCHAR NOT NULL,
-                sweep_low DOUBLE,
-                target_price DOUBLE,
-                timestamp TIMESTAMP NOT NULL
-            )
-            """
+        _ensure_setup_table(conn)
+        row = _fetch_symbol_setup(
+            conn=conn,
+            strategy=FAIR_PRICE_STRATEGY,
+            phases=("PHASE_0_ANCHORED", "PHASE_1_DISPLACED"),
+            symbol=symbol,
+            primary_symbol=primary_sym,
         )
-        row = conn.execute(
-            """
-            SELECT setup_id, phase, target_price
-            FROM setup_state_machine
-            WHERE strategy = ?
-              AND phase IN ('PHASE_0_ANCHORED', 'PHASE_1_DISPLACED')
-            ORDER BY timestamp DESC
-            LIMIT 1
-            """,
-            [FAIR_PRICE_STRATEGY],
-        ).fetchone()
 
-        if row is None or row[2] is None:
-            return {
-                **state,
-                "trade_intents": [],
-                "action": "HOLD",
-                "target_price": None,
-                "rationale": "Session Open Watch: no active Fair Price anchor in DuckDB.",
-            }
+        if row is None or row[3] is None:
+            return None, f"{symbol.split('/')[0]}: HOLD"
 
-        setup_id, phase, fair_price = str(row[0]), str(row[1]), float(row[2])
+        setup_id, phase, fair_price = str(row[0]), str(row[1]), float(row[3])
         if fair_price <= 0.0:
-            return {
-                **state,
-                "trade_intents": [],
-                "action": "HOLD",
-                "target_price": None,
-                "rationale": "Session Open Watch: invalid Fair Price anchor.",
-            }
+            return None, f"{symbol.split('/')[0]}: HOLD"
 
         if phase == "PHASE_0_ANCHORED":
             displacement_pct = abs(current_price - fair_price) / fair_price
@@ -232,27 +307,9 @@ def _evaluate_session_open_reversion(state: AgentState) -> AgentState:
                     f"[Scalper] {setup_id} Phase 1 Displaced: price ${current_price:.2f} "
                     f"deviated {displacement_pct:.3%} from Fair Price ${fair_price:.2f}"
                 )
-                return {
-                    **state,
-                    "trade_intents": [],
-                    "action": "HOLD",
-                    "target_price": None,
-                    "rationale": (
-                        f"Phase 1 Displaced ({displacement_pct:.2%} from Fair Price "
-                        f"${fair_price:.2f}); monitoring for structure break."
-                    ),
-                }
+                return None, f"{symbol.split('/')[0]}: PHASE_1_DISPLACED"
 
-            return {
-                **state,
-                "trade_intents": [],
-                "action": "HOLD",
-                "target_price": None,
-                "rationale": (
-                    f"Phase 0 Anchored at ${fair_price:.2f}; displacement "
-                    f"{displacement_pct:.3%} (< 0.20%)."
-                ),
-            }
+            return None, f"{symbol.split('/')[0]}: PHASE_0_ANCHORED"
 
         if phase == "PHASE_1_DISPLACED" and len(df) >= 2:
             prev = df.iloc[-2]
@@ -300,22 +357,48 @@ def _evaluate_session_open_reversion(state: AgentState) -> AgentState:
                     rationale=rationale,
                 )
                 print(f"[Scalper] {rationale}")
-                return {
-                    **state,
-                    "trade_intents": [intent],
-                    "action": intent.action,
-                    "target_price": intent.target_price,
-                    "rationale": intent.rationale,
-                }
+                return intent, f"{symbol.split('/')[0]}: PHASE_2_TRIGGERED"
     finally:
         conn.close()
+
+    return None, f"{symbol.split('/')[0]}: PHASE_1_DISPLACED"
+
+
+def _evaluate_session_open_reversion(
+    state: AgentState,
+    symbol: str | None = None,
+) -> AgentState:
+    """Execute J.J. Simon Fair Price Reversion across all watched symbols in ``SESSION_OPEN_WATCH``."""
+    symbols = [symbol] if symbol is not None else list(
+        state.get("asset_symbols") or [state.get("asset_symbol", "BTC/USD")]
+    )
+    intents: list[TradeIntent] = []
+    status_parts: list[str] = []
+
+    for sym in symbols:
+        intent, status = _evaluate_session_open_reversion_for_symbol(state, sym)
+        status_parts.append(status)
+        if intent is not None:
+            intents.append(intent)
+
+    if intents:
+        primary = intents[0]
+        return {
+            **state,
+            "trade_intents": intents,
+            "action": primary.action,
+            "target_price": primary.target_price,
+            "rationale": "; ".join(i.rationale for i in intents),
+        }
 
     return {
         **state,
         "trade_intents": [],
         "action": "HOLD",
         "target_price": None,
-        "rationale": "Session Open Watch: awaiting Phase 2 reversion candle.",
+        "rationale": " | ".join(status_parts)
+        if status_parts
+        else "Session Open Watch: awaiting Phase 2 reversion candle.",
     }
 
 
@@ -352,47 +435,34 @@ def _get_htf_1h_dataframe(
     return resampled if len(resampled) >= 2 else None
 
 
-def _evaluate_crt_rebreak(state: AgentState) -> TradeIntent | None:
-    """Execute the 24/7 CRT Re-break 4-phase state machine via DuckDB ``setup_state_machine``."""
-    symbol = state.get("asset_symbol", "BTC/USD")
-    df_exec = _get_symbol_dataframe(state, symbol)
-    current_price = float(state.get("current_price", 0.0))
-    if current_price <= 0.0 and df_exec is not None and not df_exec.empty and "close" in df_exec.columns:
-        current_price = float(df_exec["close"].iloc[-1])
+def _evaluate_crt_rebreak(
+    state: AgentState,
+    symbol: str | None = None,
+) -> TradeIntent | None:
+    """Execute the 24/7 CRT Re-break 4-phase state machine for ``symbol``."""
+    primary_sym = str(state.get("asset_symbol", "BTC/USD"))
+    target_sym = symbol or primary_sym
+    df_exec = _get_exec_1m_dataframe(state, target_sym)
+    current_price = _resolve_symbol_price(state, target_sym, df_exec)
 
     if current_price <= 0.0:
         return None
 
     conn = duckdb.connect(DB_PATH)
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS setup_state_machine (
-                setup_id VARCHAR PRIMARY KEY,
-                strategy VARCHAR NOT NULL,
-                phase VARCHAR NOT NULL,
-                sweep_low DOUBLE,
-                target_price DOUBLE,
-                timestamp TIMESTAMP NOT NULL
-            )
-            """
+        _ensure_setup_table(conn)
+
+        row = _fetch_symbol_setup(
+            conn=conn,
+            strategy=CRT_REBREAK_STRATEGY,
+            phases=("PHASE_1_SWEPT", "PHASE_2_FIRST_BREAK", "PHASE_3_PULLBACK"),
+            symbol=target_sym,
+            primary_symbol=primary_sym,
         )
 
-        row = conn.execute(
-            """
-            SELECT setup_id, phase, sweep_low, target_price
-            FROM setup_state_machine
-            WHERE strategy = ?
-              AND phase IN ('PHASE_1_SWEPT', 'PHASE_2_FIRST_BREAK', 'PHASE_3_PULLBACK')
-            ORDER BY timestamp DESC
-            LIMIT 1
-            """,
-            [CRT_REBREAK_STRATEGY],
-        ).fetchone()
-
-        # Phase 0 & Phase 1: Monitor 1H candles when no CRT setup is active.
+        # Phase 0 & Phase 1: Monitor 1H candles when no CRT setup is active for target_sym.
         if row is None:
-            df_1h = _get_htf_1h_dataframe(state, symbol, df_exec)
+            df_1h = _get_htf_1h_dataframe(state, target_sym, df_exec)
             if df_1h is None or len(df_1h) < 2 or not {"high", "low", "close"}.issubset(df_1h.columns):
                 return None
 
@@ -418,7 +488,10 @@ def _evaluate_crt_rebreak(state: AgentState) -> TradeIntent | None:
 
             midpoint = (h2 + l2) / 2.0
             now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-            setup_id = f"CRT-{direction}-{now_naive.strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+            setup_id = (
+                f"crt:{target_sym}:{direction}-"
+                f"{now_naive.strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+            )
             conn.execute(
                 """
                 INSERT INTO setup_state_machine (
@@ -443,7 +516,7 @@ def _evaluate_crt_rebreak(state: AgentState) -> TradeIntent | None:
         if row[2] is None or row[3] is None:
             return None
         midpoint, target_extreme = float(row[2]), float(row[3])
-        is_long = setup_id.startswith("CRT-LONG") or target_extreme > midpoint
+        is_long = ":LONG-" in setup_id or setup_id.startswith("CRT-LONG") or target_extreme > midpoint
 
         # Phase 2 (First Break): Price crosses M in trade direction (no entry yet).
         if phase == "PHASE_1_SWEPT":
@@ -488,13 +561,13 @@ def _evaluate_crt_rebreak(state: AgentState) -> TradeIntent | None:
             )
             action = "LIMIT_BUY" if is_long else "LIMIT_SELL"
             rationale = (
-                f"CRT Re-break Phase 4 {action} on {symbol} ({setup_id}): "
+                f"CRT Re-break Phase 4 {action} on {target_sym} ({setup_id}): "
                 f"entry at M=${midpoint:.2f}, target=${target_extreme:.2f}, "
                 f"raw_sl=${raw_stop_loss:.2f} (1.5R)."
             )
             print(f"[Scalper] {rationale}")
             return TradeIntent(
-                symbol=symbol,
+                symbol=target_sym,
                 action=action,  # type: ignore[arg-type]
                 target_price=round(midpoint, 6),
                 qty=round(TRANCHE_NOTIONAL_USD / midpoint, QTY_PRECISION),
@@ -606,13 +679,15 @@ def _find_latest_1m_fvg(df_1m: pd.DataFrame, is_long: bool) -> tuple[float, floa
     return None
 
 
-def _evaluate_smc_golden_fvg(state: AgentState) -> TradeIntent | None:
-    """Strategy 3: MTF Market Shift + Golden Zone (50%-61.8%) FVG Limit Entry."""
-    symbol = state.get("asset_symbol", "BTC/USD")
-    df_exec = _get_symbol_dataframe(state, symbol)
-    current_price = float(state.get("current_price", 0.0))
-    if current_price <= 0.0 and df_exec is not None and not df_exec.empty and "close" in df_exec.columns:
-        current_price = float(df_exec["close"].iloc[-1])
+def _evaluate_smc_golden_fvg(
+    state: AgentState,
+    symbol: str | None = None,
+) -> TradeIntent | None:
+    """Strategy 3: MTF Market Shift + Golden Zone (50%-61.8%) FVG Limit Entry for ``symbol``."""
+    primary_sym = str(state.get("asset_symbol", "BTC/USD"))
+    target_sym = symbol or primary_sym
+    df_exec = _get_exec_1m_dataframe(state, target_sym)
+    current_price = _resolve_symbol_price(state, target_sym, df_exec)
 
     if current_price <= 0.0:
         return None
@@ -620,21 +695,17 @@ def _evaluate_smc_golden_fvg(state: AgentState) -> TradeIntent | None:
     conn = duckdb.connect(DB_PATH)
     try:
         _ensure_setup_table(conn)
-        row = conn.execute(
-            """
-            SELECT setup_id, phase, sweep_low, target_price
-            FROM setup_state_machine
-            WHERE strategy = ?
-              AND phase IN ('PHASE_1_POI_TAPPED', 'PHASE_2_CHOCH')
-            ORDER BY timestamp DESC
-            LIMIT 1
-            """,
-            [SMC_GOLDEN_FVG_STRATEGY],
-        ).fetchone()
+        row = _fetch_symbol_setup(
+            conn=conn,
+            strategy=SMC_GOLDEN_FVG_STRATEGY,
+            phases=("PHASE_1_POI_TAPPED", "PHASE_2_CHOCH"),
+            symbol=target_sym,
+            primary_symbol=primary_sym,
+        )
 
         # Phase 1 (PHASE_1_POI_TAPPED): 15m FVG tap detection
         if row is None:
-            df_15m = _get_mtf_15m_dataframe(state, symbol, df_exec)
+            df_15m = _get_mtf_15m_dataframe(state, target_sym, df_exec)
             if df_15m is None:
                 return None
             tapped = _find_tapped_15m_fvg(df_15m, current_price)
@@ -643,7 +714,10 @@ def _evaluate_smc_golden_fvg(state: AgentState) -> TradeIntent | None:
 
             direction, fvg_low, fvg_high = tapped
             now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-            setup_id = f"SMC-{direction}-{now_naive.strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+            setup_id = (
+                f"smc_fvg:{target_sym}:{direction}-"
+                f"{now_naive.strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+            )
             conn.execute(
                 """
                 INSERT INTO setup_state_machine (
@@ -663,7 +737,7 @@ def _evaluate_smc_golden_fvg(state: AgentState) -> TradeIntent | None:
             return None
 
         setup_id, phase = str(row[0]), str(row[1])
-        is_long = setup_id.startswith("SMC-LONG")
+        is_long = ":LONG-" in setup_id or setup_id.startswith("SMC-LONG")
 
         # Phase 2 (PHASE_2_CHOCH): 1m liquidity sweep + full-body CHoCH + new 1m FVG
         if phase == "PHASE_1_POI_TAPPED":
@@ -742,13 +816,13 @@ def _evaluate_smc_golden_fvg(state: AgentState) -> TradeIntent | None:
                 [setup_id],
             )
             rationale = (
-                f"SMC Golden FVG {action} on {symbol} ({setup_id}): "
+                f"SMC Golden FVG {action} on {target_sym} ({setup_id}): "
                 f"Golden Zone [{gz_low:.2f}, {gz_high:.2f}] aligned with 1m FVG "
                 f"[{fvg_low:.2f}, {fvg_high:.2f}] -> entry=${entry_price:.2f}, raw_sl=${raw_sl:.2f}."
             )
             print(f"[Scalper] {rationale}")
             return TradeIntent(
-                symbol=symbol,
+                symbol=target_sym,
                 action=action,  # type: ignore[arg-type]
                 target_price=round(entry_price, 6),
                 qty=round(TRANCHE_NOTIONAL_USD / entry_price, QTY_PRECISION),
@@ -817,33 +891,31 @@ def _compute_rolling_val_and_lvn(
     return (lvn_low, lvn_high)
 
 
-def _evaluate_lvn_absorption_squeeze(state: AgentState) -> TradeIntent | None:
-    """Strategy 4: 60-bar Rolling Volume Profile VAL/LVN Absorption Squeeze."""
-    symbol = state.get("asset_symbol", "BTC/USD")
-    df_exec = _get_symbol_dataframe(state, symbol)
+def _evaluate_lvn_absorption_squeeze(
+    state: AgentState,
+    symbol: str | None = None,
+) -> TradeIntent | None:
+    """Strategy 4: 60-bar Rolling Volume Profile VAL/LVN Absorption Squeeze for ``symbol``."""
+    primary_sym = str(state.get("asset_symbol", "BTC/USD"))
+    target_sym = symbol or primary_sym
+    df_exec = _get_exec_1m_dataframe(state, target_sym)
     if df_exec is None or df_exec.empty or not {"open", "high", "low", "close"}.issubset(df_exec.columns):
         return None
 
-    current_price = float(state.get("current_price", 0.0))
-    if current_price <= 0.0:
-        current_price = float(df_exec["close"].iloc[-1])
+    current_price = _resolve_symbol_price(state, target_sym, df_exec)
     if current_price <= 0.0:
         return None
 
     conn = duckdb.connect(DB_PATH)
     try:
         _ensure_setup_table(conn)
-        row = conn.execute(
-            """
-            SELECT setup_id, phase, sweep_low, target_price
-            FROM setup_state_machine
-            WHERE strategy = ?
-              AND phase IN ('PHASE_1_LVN_IDENTIFIED', 'PHASE_2_ABSORPTION')
-            ORDER BY timestamp DESC
-            LIMIT 1
-            """,
-            [LVN_ABSORPTION_STRATEGY],
-        ).fetchone()
+        row = _fetch_symbol_setup(
+            conn=conn,
+            strategy=LVN_ABSORPTION_STRATEGY,
+            phases=("PHASE_1_LVN_IDENTIFIED", "PHASE_2_ABSORPTION"),
+            symbol=target_sym,
+            primary_symbol=primary_sym,
+        )
 
         # Phase 1 (PHASE_1_LVN_IDENTIFIED): 60-bar rolling Volume Profile VAL + LVN
         if row is None:
@@ -852,7 +924,10 @@ def _evaluate_lvn_absorption_squeeze(state: AgentState) -> TradeIntent | None:
                 return None
             lvn_low, lvn_high = lvn_zone
             now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-            setup_id = f"LVN-LONG-{now_naive.strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+            setup_id = (
+                f"lvn:{target_sym}:LONG-"
+                f"{now_naive.strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
+            )
             conn.execute(
                 """
                 INSERT INTO setup_state_machine (
@@ -920,13 +995,13 @@ def _evaluate_lvn_absorption_squeeze(state: AgentState) -> TradeIntent | None:
                     [setup_id],
                 )
                 rationale = (
-                    f"LVN Absorption Squeeze MARKET_BUY on {symbol} ({setup_id}): "
+                    f"LVN Absorption Squeeze MARKET_BUY on {target_sym} ({setup_id}): "
                     f"price ${current_price:.2f} broke above absorption high ${absorption_high:.2f}, "
                     f"raw_sl=${absorption_low:.2f}."
                 )
                 print(f"[Scalper] {rationale}")
                 return TradeIntent(
-                    symbol=symbol,
+                    symbol=target_sym,
                     action="MARKET_BUY",
                     target_price=round(current_price, 6),
                     qty=round(TRANCHE_NOTIONAL_USD / current_price, QTY_PRECISION),
@@ -941,7 +1016,7 @@ def _evaluate_lvn_absorption_squeeze(state: AgentState) -> TradeIntent | None:
 
 
 def scalper_expert_node(state: AgentState) -> AgentState:
-    """Scan ``state['asset_symbols']`` and emit maker-only ``TradeIntent`` objects."""
+    """Scan ``state['asset_symbols']`` across all strategies and emit ``TradeIntent`` objects."""
     if (
         str(state.get("market_regime", "")).upper() == "SUSPENDED"
         or str(state.get("action", "")).upper() == "CIRCUIT_BREAKER"
@@ -958,24 +1033,32 @@ def scalper_expert_node(state: AgentState) -> AgentState:
     if str(state.get("market_regime", "")).upper() == "SESSION_OPEN_WATCH":
         return _evaluate_session_open_reversion(state)
 
-    for strategy_fn in (
-        _evaluate_crt_rebreak,
-        _evaluate_smc_golden_fvg,
-        _evaluate_lvn_absorption_squeeze,
-    ):
-        strategy_intent = strategy_fn(state)
-        if strategy_intent is not None:
-            return {
-                **state,
-                "trade_intents": [strategy_intent],
-                "action": strategy_intent.action,
-                "target_price": strategy_intent.target_price,
-                "rationale": strategy_intent.rationale,
-            }
+    primary_symbol = str(state.get("asset_symbol", "BTC/USD"))
+    symbols = list(state.get("asset_symbols") or [primary_symbol])
+    strategy_intents: list[TradeIntent] = []
 
-    symbols = state.get("asset_symbols") or [state.get("asset_symbol", "BTC/USD")]
+    for sym in symbols:
+        for strategy_fn in (
+            _evaluate_crt_rebreak,
+            _evaluate_smc_golden_fvg,
+            _evaluate_lvn_absorption_squeeze,
+        ):
+            strategy_intent = strategy_fn(state, symbol=sym)
+            if strategy_intent is not None:
+                strategy_intents.append(strategy_intent)
+                break
+
+    if strategy_intents:
+        primary = strategy_intents[0]
+        return {
+            **state,
+            "trade_intents": strategy_intents,
+            "action": primary.action,
+            "target_price": primary.target_price,
+            "rationale": "; ".join(i.rationale for i in strategy_intents),
+        }
+
     intents: list[TradeIntent] = []
-
     for symbol in symbols:
         df = _get_symbol_dataframe(state, symbol)
         if df is None:
@@ -996,11 +1079,12 @@ def scalper_expert_node(state: AgentState) -> AgentState:
             "rationale": primary.rationale,
         }
 
+    phase_summary = _summarize_active_symbol_phases(symbols, primary_symbol)
     print("[Scalper] Emitted 0 intents | Action: HOLD")
     return {
         **state,
         "trade_intents": [],
         "action": "HOLD",
         "target_price": None,
-        "rationale": "Scalper hold: no tickers met fee-adjusted or grid criteria.",
+        "rationale": phase_summary or "Scalper hold: no tickers met fee-adjusted or grid criteria.",
     }

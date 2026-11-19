@@ -121,15 +121,22 @@ def test_market_observer_node_success(base_state: AgentState) -> None:
         patch("observer_node.get_crypto_bars", return_value=bars) as mock_mcp,
         patch("observer_node.get_live_crypto_price", return_value=None),
         patch("observer_node._fetch_macro_context", return_value="No high-impact events."),
+        patch("observer_node.time.sleep"),
     ):
         updated_state = market_observer_node(base_state)
 
-    mock_mcp.assert_called_once_with(symbol="BTC/USD", timeframe=BAR_TIMEFRAME, limit=BAR_LIMIT)
+    mock_mcp.assert_any_call(symbol="BTC/USD", timeframe=BAR_TIMEFRAME, limit=BAR_LIMIT)
     _assert_valid_agent_state(updated_state)
 
     df = updated_state["historical_data"]
     for col in ("open", "high", "low", "close", "volume"):
         assert df[col].dtype == np.float64
+
+    market_map = updated_state["market_data_by_symbol"]
+    for sym in ("BTC/USD", "ETH/USD", "SOL/USD"):
+        for key in (sym, f"{sym}_1H", f"{sym}_15M", f"{sym}_1M"):
+            assert key in market_map
+            assert len(market_map[key]) == 3
 
     assert updated_state["current_price"] == pytest.approx(bars[-1]["close"])
     assert updated_state["error_message"] is None
@@ -264,9 +271,12 @@ def test_get_live_crypto_price_uses_native_alpaca_sdk(base_state: AgentState) ->
         patch("observer_node.get_crypto_bars", return_value=bars),
         patch("observer_node.get_alpaca_crypto_data_client", return_value=mock_sdk_client),
         patch("observer_node._fetch_macro_context", return_value="FOMC Rate Decision in 30m"),
+        patch("observer_node.time.sleep"),
     ):
         updated = market_observer_node(state_with_live)  # type: ignore[arg-type]
 
     assert updated["current_price"] == pytest.approx(91500.0)
     assert updated["live_price"] == pytest.approx(91500.0)  # type: ignore[typeddict-item]
+    assert len(updated["market_data_by_symbol"]["BTC/USD"]) == 3
+    assert float(updated["market_data_by_symbol"]["BTC/USD"]["close"].iloc[-1]) == pytest.approx(91500.0)
     assert "FOMC Rate Decision" in updated["macro_context"]

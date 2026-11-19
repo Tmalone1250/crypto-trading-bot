@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import time
 from typing import Any
 
 from alpaca.data.requests import CryptoLatestQuoteRequest
@@ -29,6 +30,11 @@ load_dotenv()
 
 BAR_TIMEFRAME: str = "1Hour"
 BAR_LIMIT: int = 250
+MTF_15M_TIMEFRAME: str = "15Min"
+MTF_15M_LIMIT: int = 100
+MTF_1M_TIMEFRAME: str = "1Min"
+MTF_1M_LIMIT: int = 100
+BAR_REQUEST_DELAY_SECONDS: float = 0.2
 LOOKBACK_DAYS: int = 12
 OHLCV_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
 MACRO_CALENDAR_URL: str = (
@@ -378,22 +384,51 @@ def _fetch_macro_context(timeout: float = 10.0) -> str:
     return "\n".join(lines)
 
 
+def _apply_live_price_to_df(df: pd.DataFrame, live_price: float | None) -> pd.DataFrame:
+    """Update the latest candle close/high/low with ``live_price`` without collapsing rows."""
+    if df is None or df.empty or live_price is None or live_price <= 0.0:
+        return df
+    updated = df.copy()
+    last_idx = updated.index[-1]
+    updated.loc[last_idx, "close"] = float(live_price)
+    if "high" in updated.columns and float(updated.loc[last_idx, "high"]) < live_price:
+        updated.loc[last_idx, "high"] = float(live_price)
+    if "low" in updated.columns and float(updated.loc[last_idx, "low"]) > live_price:
+        updated.loc[last_idx, "low"] = float(live_price)
+    return updated
+
+
+def _fetch_formatted_bars(
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    mcp_client: Any = None,
+) -> pd.DataFrame:
+    """Invoke ``get_crypto_bars`` and normalize the response into an OHLCV DataFrame."""
+    if mcp_client is not None:
+        raw_bars = get_crypto_bars(
+            symbol=symbol,
+            timeframe=timeframe,
+            limit=limit,
+            mcp_client=mcp_client,
+        )
+    else:
+        raw_bars = get_crypto_bars(symbol=symbol, timeframe=timeframe, limit=limit)
+    return _format_bars_dataframe(raw_bars, symbol)
+
+
 def market_observer_node(state: AgentState) -> AgentState:
-    """Fetch live bars, native SDK real-time quote, and macro calendar context."""
+    """Fetch multi-asset MTF bars (1H, 15M, 1M), native SDK live quotes, and macro context."""
     symbol = state["asset_symbol"]
     mcp_client = state.get("mcp_client")
 
     try:
-        if mcp_client is not None:
-            raw_bars = get_crypto_bars(
-                symbol=symbol,
-                timeframe=BAR_TIMEFRAME,
-                limit=BAR_LIMIT,
-                mcp_client=mcp_client,
-            )
-        else:
-            raw_bars = get_crypto_bars(symbol=symbol, timeframe=BAR_TIMEFRAME, limit=BAR_LIMIT)
-        df = _format_bars_dataframe(raw_bars, symbol)
+        df = _fetch_formatted_bars(
+            symbol=symbol,
+            timeframe=BAR_TIMEFRAME,
+            limit=BAR_LIMIT,
+            mcp_client=mcp_client,
+        )
     except Exception as exc:
         return {
             **state,
@@ -408,26 +443,64 @@ def market_observer_node(state: AgentState) -> AgentState:
 
     live_price = get_live_crypto_price(symbol=symbol)
     latest_price = live_price if live_price is not None else float(df["close"].iloc[-1])
+    df = _apply_live_price_to_df(df, live_price)
     macro_context = _fetch_macro_context()
 
     market_data_by_symbol = dict(state.get("market_data_by_symbol") or {})
     market_data_by_symbol[symbol] = df
-    for extra_sym in state.get("asset_symbols") or []:
-        if extra_sym == symbol or extra_sym in market_data_by_symbol:
-            continue
-        extra_price = get_live_crypto_price(symbol=extra_sym)
-        if extra_price is not None and extra_price > 0.0:
-            market_data_by_symbol[extra_sym] = pd.DataFrame(
-                [
-                    {
-                        "open": extra_price,
-                        "high": extra_price,
-                        "low": extra_price,
-                        "close": extra_price,
-                        "volume": 0.0,
-                    }
-                ]
-            )
+    market_data_by_symbol[f"{symbol}_1H"] = df
+
+    symbols = list(state.get("asset_symbols") or [symbol])
+    if symbol not in symbols:
+        symbols.insert(0, symbol)
+
+    for sym in symbols:
+        sym_live_price = live_price if sym == symbol else get_live_crypto_price(symbol=sym)
+
+        if sym != symbol:
+            try:
+                time.sleep(BAR_REQUEST_DELAY_SECONDS)
+                sym_1h = _fetch_formatted_bars(
+                    symbol=sym,
+                    timeframe=BAR_TIMEFRAME,
+                    limit=BAR_LIMIT,
+                    mcp_client=mcp_client,
+                )
+                if not sym_1h.empty:
+                    sym_1h = _apply_live_price_to_df(sym_1h, sym_live_price)
+                    market_data_by_symbol[sym] = sym_1h
+                    market_data_by_symbol[f"{sym}_1H"] = sym_1h
+            except Exception:
+                if sym_live_price is not None and sym_live_price > 0.0 and sym not in market_data_by_symbol:
+                    market_data_by_symbol[sym] = pd.DataFrame(
+                        [
+                            {
+                                "open": sym_live_price,
+                                "high": sym_live_price,
+                                "low": sym_live_price,
+                                "close": sym_live_price,
+                                "volume": 0.0,
+                            }
+                        ]
+                    )
+
+        for tf_suffix, tf_name, tf_limit in (
+            ("15M", MTF_15M_TIMEFRAME, MTF_15M_LIMIT),
+            ("1M", MTF_1M_TIMEFRAME, MTF_1M_LIMIT),
+        ):
+            tf_key = f"{sym}_{tf_suffix}"
+            try:
+                time.sleep(BAR_REQUEST_DELAY_SECONDS)
+                tf_df = _fetch_formatted_bars(
+                    symbol=sym,
+                    timeframe=tf_name,
+                    limit=tf_limit,
+                    mcp_client=mcp_client,
+                )
+                if not tf_df.empty:
+                    market_data_by_symbol[tf_key] = _apply_live_price_to_df(tf_df, sym_live_price)
+            except Exception:
+                pass
 
     updated_state: dict[str, Any] = {
         **state,

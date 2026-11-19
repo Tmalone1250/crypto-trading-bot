@@ -536,3 +536,71 @@ def test_scalper_bypasses_all_entries_when_suspended() -> None:
     updated = scalper_expert_node(state)
     assert updated["trade_intents"] == []
     assert updated["action"] == "CIRCUIT_BREAKER"
+
+
+def test_scalper_multi_symbol_crt_isolation_for_eth_and_sol(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify ETH/USD and SOL/USD maintain isolated setup_state_machine rows and trigger independently."""
+    db_file = str(tmp_path / "test_multi_symbol.duckdb")
+    monkeypatch.setattr(scalper_mod, "DB_PATH", db_file)
+
+    # ETH/USD 1H sweep: H1=3100, L1=3000; C2 sweeps L1 (L2=2960, H2=3040, close=3020) -> M=3000
+    eth_1h = pd.DataFrame(
+        {
+            "open": [3050.0, 3010.0],
+            "high": [3100.0, 3040.0],
+            "low": [3000.0, 2960.0],
+            "close": [3040.0, 3020.0],
+        }
+    )
+    # BTC/USD neutral (no sweep)
+    btc_1h = pd.DataFrame(
+        {
+            "open": [90100.0, 90110.0],
+            "high": [90200.0, 90180.0],
+            "low": [90000.0, 90050.0],
+            "close": [90120.0, 90120.0],
+        }
+    )
+    btc_1m = _make_df([90200.0] * 5, [90000.0] * 5, [90120.0] * 5)
+
+    def _build_multi_state(eth_price: float) -> AgentState:
+        eth_1m = _make_df([eth_price + 5.0] * 5, [eth_price - 5.0] * 5, [eth_price] * 5)
+        st = _base_state(
+            asset_symbols=["BTC/USD", "ETH/USD", "SOL/USD"],
+            market_data_by_symbol={
+                "BTC/USD": btc_1m,
+                "BTC/USD_1H": btc_1h,
+                "ETH/USD": eth_1m,
+                "ETH/USD_1M": eth_1m,
+                "ETH/USD_1H": eth_1h,
+            },
+        )
+        st["market_regime"] = "FLAT"
+        st["current_price"] = 90120.0
+        return st
+
+    # Cycle 1: ETH/USD locks PHASE_1_SWEPT (M=3000, Target=3100) while BTC/SOL stay HOLD
+    res1 = scalper_expert_node(_build_multi_state(2990.0))
+    assert res1["trade_intents"] == []
+    assert "BTC: HOLD | ETH: PHASE_1_SWEPT | SOL: HOLD" in res1["rationale"]
+
+    # Cycle 2: ETH crosses above M=3000 (3010) -> PHASE_2_FIRST_BREAK
+    res2 = scalper_expert_node(_build_multi_state(3010.0))
+    assert res2["trade_intents"] == []
+    assert "ETH: PHASE_2_FIRST_BREAK" in res2["rationale"]
+
+    # Cycle 3: ETH pulls back below M=3000 (2995) -> PHASE_3_PULLBACK
+    res3 = scalper_expert_node(_build_multi_state(2995.0))
+    assert res3["trade_intents"] == []
+    assert "ETH: PHASE_3_PULLBACK" in res3["rationale"]
+
+    # Cycle 4: ETH re-breaks M=3000 (3005) -> emits LIMIT_BUY for ETH/USD at M=3000
+    res4 = scalper_expert_node(_build_multi_state(3005.0))
+    assert len(res4["trade_intents"]) == 1
+    intent = res4["trade_intents"][0]
+    assert intent.symbol == "ETH/USD"
+    assert intent.action == "LIMIT_BUY"
+    assert intent.target_price == pytest.approx(3000.0)
+    assert intent.raw_stop_loss == pytest.approx(3000.0 - (100.0 / 1.5))

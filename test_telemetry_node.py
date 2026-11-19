@@ -192,7 +192,7 @@ def test_telemetry_node_serializes_trade_intents_and_overrides_flat_scalp_headli
 
 
 def test_telemetry_node_serializes_multi_asset_watched_prices() -> None:
-    """Verify ``watched_assets`` maps BTC/USD, ETH/USD, and SOL/USD to their latest prices."""
+    """Verify ``watched_assets``, ``open_positions``, and ``asset_phases`` serialize cleanly."""
     in_mem_conn = duckdb.connect(":memory:")
     conn_proxy = _PersistentInMemoryConn(in_mem_conn)
     state = _sample_state(
@@ -201,19 +201,43 @@ def test_telemetry_node_serializes_multi_asset_watched_prices() -> None:
             "ETH/USD": pd.DataFrame([{"close": 3125.75}]),
             "SOL/USD": pd.DataFrame([{"close": 185.40}]),
         },
+        open_positions=[
+            {
+                "symbol": "ETHUSD",
+                "qty": "0.15",
+                "avg_entry_price": "3100.0",
+                "unrealized_pl": "3.86",
+            }
+        ],
+        rationale="BTC: HOLD | ETH: PHASE_1_SWEPT | SOL: PHASE_2_CHOCH",
     )
 
     try:
         with patch("telemetry_node.duckdb.connect", return_value=conn_proxy):
             telemetry_node(state)
 
-        watched_raw = in_mem_conn.execute(
-            "SELECT watched_assets FROM agent_telemetry LIMIT 1"
-        ).fetchone()[0]
+        row = in_mem_conn.execute(
+            "SELECT watched_assets, open_positions, asset_phases FROM agent_telemetry LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        watched_raw, open_pos_raw, phases_raw = row
         assert json.loads(watched_raw) == {
             "BTC/USD": 91250.5,
             "ETH/USD": 3125.75,
             "SOL/USD": 185.4,
+        }
+        assert json.loads(open_pos_raw) == [
+            {
+                "symbol": "ETHUSD",
+                "qty": 0.15,
+                "avg_entry_price": 3100.0,
+                "unrealized_pl": 3.86,
+            }
+        ]
+        assert json.loads(phases_raw) == {
+            "BTC/USD": "HOLD",
+            "ETH/USD": "PHASE_1_SWEPT",
+            "SOL/USD": "PHASE_2_CHOCH",
         }
     finally:
         in_mem_conn.close()

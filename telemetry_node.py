@@ -67,6 +67,88 @@ def _serialize_watched_assets(state: AgentState) -> str:
     return json.dumps(watched)
 
 
+def _serialize_open_positions(state: AgentState) -> str:
+    """Serialize active open positions (symbol, qty, avg_entry_price, unrealized_pl) to JSON."""
+    positions = state.get("open_positions") or []
+    cleaned: list[dict[str, Any]] = []
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        cleaned.append(
+            {
+                "symbol": str(pos.get("symbol", "")),
+                "qty": _parse_optional_float(pos.get("qty")),
+                "avg_entry_price": _parse_optional_float(pos.get("avg_entry_price")),
+                "unrealized_pl": _parse_optional_float(
+                    pos.get("unrealized_pl", pos.get("unrealized_pnl"))
+                ),
+            }
+        )
+    return json.dumps(cleaned)
+
+
+def _resolve_asset_phases(
+    state: AgentState,
+    conn: duckdb.DuckDBPyConnection,
+) -> str:
+    """Resolve current strategy phase (or HOLD) per watched symbol and serialize to JSON."""
+    primary_symbol = str(state.get("asset_symbol", "BTC/USD"))
+    symbols = list(state.get("asset_symbols") or [primary_symbol])
+    phases: dict[str, str] = {str(sym): "HOLD" for sym in symbols}
+
+    # 1. Check DuckDB setup_state_machine if available.
+    try:
+        for sym in symbols:
+            row = conn.execute(
+                """
+                SELECT phase
+                FROM setup_state_machine
+                WHERE (
+                    setup_id LIKE ?
+                    OR setup_id LIKE ?
+                    OR (? = ? AND setup_id NOT LIKE '%:%')
+                )
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                [f"%:{sym}:%", f"%:{sym}", sym, primary_symbol],
+            ).fetchone()
+            if row is not None and row[0]:
+                phases[str(sym)] = str(row[0])
+    except Exception:
+        pass
+
+    # 2. Check cycle rationale summary (e.g. "BTC: PHASE_1_SWEPT | ETH: HOLD").
+    rationale = str(state.get("rationale", ""))
+    for part in rationale.split("|"):
+        segment = part.strip()
+        if ":" in segment:
+            prefix, val = segment.split(":", 1)
+            prefix_clean = prefix.strip().upper()
+            val_clean = val.strip()
+            for sym in symbols:
+                if sym.upper() == prefix_clean or sym.split("/")[0].upper() == prefix_clean:
+                    if val_clean.startswith("PHASE_") or val_clean == "HOLD":
+                        phases[str(sym)] = val_clean
+
+    # 3. Override with any emitted TradeIntent action for the symbol this cycle.
+    for intent in state.get("trade_intents") or []:
+        intent_sym = (
+            intent.get("symbol")
+            if isinstance(intent, dict)
+            else getattr(intent, "symbol", None)
+        )
+        intent_act = (
+            intent.get("action")
+            if isinstance(intent, dict)
+            else getattr(intent, "action", None)
+        )
+        if intent_sym and intent_act and str(intent_sym) in phases:
+            phases[str(intent_sym)] = str(intent_act)
+
+    return json.dumps(phases)
+
+
 def _log_telemetry_to_duckdb(
     timestamp: datetime,
     portfolio_value: float | None,
@@ -76,8 +158,10 @@ def _log_telemetry_to_duckdb(
     rationale: str,
     scalper_intents: str,
     watched_assets: str,
+    open_positions: str,
+    state: AgentState,
 ) -> None:
-    """Ensure ``agent_telemetry`` exists (with ``scalper_intents`` & ``watched_assets``) and insert a snapshot."""
+    """Ensure ``agent_telemetry`` exists (with all dashboard columns) and insert a snapshot."""
     conn = duckdb.connect(DB_PATH)
     try:
         conn.execute(
@@ -90,17 +174,24 @@ def _log_telemetry_to_duckdb(
                 target_price DOUBLE,
                 rationale VARCHAR,
                 scalper_intents VARCHAR,
-                watched_assets VARCHAR
+                watched_assets VARCHAR,
+                open_positions VARCHAR,
+                asset_phases VARCHAR
             )
             """
         )
         # Failsafe schema upgrades for pre-existing agent_telemetry tables.
-        conn.execute(
-            "ALTER TABLE agent_telemetry ADD COLUMN IF NOT EXISTS scalper_intents VARCHAR"
-        )
-        conn.execute(
-            "ALTER TABLE agent_telemetry ADD COLUMN IF NOT EXISTS watched_assets VARCHAR"
-        )
+        for col_name in (
+            "scalper_intents",
+            "watched_assets",
+            "open_positions",
+            "asset_phases",
+        ):
+            conn.execute(
+                f"ALTER TABLE agent_telemetry ADD COLUMN IF NOT EXISTS {col_name} VARCHAR"
+            )
+
+        asset_phases = _resolve_asset_phases(state, conn)
         conn.execute(
             """
             INSERT INTO agent_telemetry (
@@ -111,9 +202,11 @@ def _log_telemetry_to_duckdb(
                 target_price,
                 rationale,
                 scalper_intents,
-                watched_assets
+                watched_assets,
+                open_positions,
+                asset_phases
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 timestamp,
@@ -124,6 +217,8 @@ def _log_telemetry_to_duckdb(
                 rationale,
                 scalper_intents,
                 watched_assets,
+                open_positions,
+                asset_phases,
             ],
         )
     finally:
@@ -141,6 +236,7 @@ def telemetry_node(state: AgentState) -> AgentState:
     trade_intents = state.get("trade_intents") or []
     scalper_intents_json = _serialize_trade_intents(trade_intents)
     watched_assets_json = _serialize_watched_assets(state)
+    open_positions_json = _serialize_open_positions(state)
     timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
 
     if market_regime.upper() == "FLAT" and trade_intents:
@@ -157,6 +253,8 @@ def telemetry_node(state: AgentState) -> AgentState:
             rationale=rationale,
             scalper_intents=scalper_intents_json,
             watched_assets=watched_assets_json,
+            open_positions=open_positions_json,
+            state=state,
         )
         print(
             f"[Telemetry] Logged cycle: regime={market_regime} | action={action} "
