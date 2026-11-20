@@ -241,3 +241,85 @@ def test_telemetry_node_serializes_multi_asset_watched_prices() -> None:
         }
     finally:
         in_mem_conn.close()
+
+
+def test_action_ledger_csv_export_endpoint_and_filters(tmp_path) -> None:
+    """Verify ``action_log`` writes and ``GET /api/export/actions.csv`` schema + query filters."""
+    import csv
+    import io
+    import urllib.request
+
+    from action_ledger import ACTION_LOG_COLUMNS, log_action
+    from telemetry_api import start_telemetry_server
+
+    db_file = str(tmp_path / "test_actions.duckdb")
+    log_action(
+        action="LIMIT_BUY",
+        symbol="BTC/USD",
+        asset_id="ord-buy-1",
+        qty=0.002,
+        notional=200.0,
+        price_or_value=100000.0,
+        strategy="FLAT",
+        reason="Lower-20% range buy",
+        mode="paper",
+        db_path=db_file,
+    )
+    log_action(
+        action="MARKET_SELL",
+        symbol="SOL/USD",
+        asset_id="ord-sell-2",
+        qty=2.0,
+        notional=191.0,
+        price_or_value=95.5,
+        pnl_amount=-9.0,
+        pnl_pct=-4.5,
+        strategy="GRID_STOP",
+        reason="Grid safety stop-loss triggered (-4.0%)",
+        mode="paper",
+        db_path=db_file,
+    )
+    log_action(
+        action="RISK_BLOCK",
+        symbol="ETH/USD",
+        price_or_value=3000.0,
+        strategy="RISK_MANAGER",
+        reason="Risk veto: high volatility",
+        mode="paper",
+        db_path=db_file,
+    )
+
+    server, _ = start_telemetry_server(host="127.0.0.1", port=0, db_path=db_file)
+    port = server.server_address[1]
+    try:
+        # 1. Unfiltered export returns all 3 real actions with exact 14-column header
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/export/actions.csv?limit=1000", timeout=5
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers.get("Content-Type", "").startswith("text/csv")
+            assert 'filename="alpaca_actions.csv"' in resp.headers.get("Content-Disposition", "")
+            assert resp.headers.get("Access-Control-Allow-Origin") == "*"
+            body = resp.read().decode("utf-8")
+
+        rows = list(csv.reader(io.StringIO(body)))
+        assert tuple(rows[0]) == ACTION_LOG_COLUMNS
+        assert len(rows) == 4  # header + 3 actions
+        assert rows[1][1] == "alpaca_crypto"
+        assert rows[1][8] == "USD"
+
+        # 2. Filtered export (?actions=BUY,SELL) excludes RISK_BLOCK and keeps LIMIT_BUY & MARKET_SELL
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/export/actions.csv?actions=BUY,SELL&limit=10",
+            timeout=5,
+        ) as resp_filtered:
+            assert resp_filtered.status == 200
+            filtered_rows = list(csv.reader(io.StringIO(resp_filtered.read().decode("utf-8"))))
+
+        assert tuple(filtered_rows[0]) == ACTION_LOG_COLUMNS
+        assert len(filtered_rows) == 3  # header + LIMIT_BUY + MARKET_SELL
+        exported_actions = {r[3] for r in filtered_rows[1:]}
+        assert exported_actions == {"LIMIT_BUY", "MARKET_SELL"}
+    finally:
+        server.shutdown()
+        server.server_close()

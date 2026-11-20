@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
   Clock,
+  Download,
   RefreshCw,
   Terminal,
   TrendingUp,
@@ -270,6 +271,15 @@ export default function CommandCenterPage() {
                 {lastSync}
               </span>
             </div>
+
+            <a
+              href="/api/export/actions.csv"
+              download="alpaca_actions.csv"
+              className="inline-flex items-center gap-1.5 border border-orange-500 bg-black px-3 py-2 font-mono text-xs font-bold uppercase tracking-wider text-orange-500 transition-colors hover:bg-orange-500 hover:text-black"
+            >
+              <Download className="h-3.5 w-3.5" />
+              Export CSV
+            </a>
           </div>
         </header>
 

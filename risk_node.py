@@ -9,6 +9,7 @@ import os
 import numpy as np
 import talib
 
+from action_ledger import log_action
 from state import AgentState
 
 ACCOUNT_SIZE_USD: float = 25.00
@@ -220,14 +221,24 @@ def risk_manager_node(state: AgentState) -> AgentState:
         projected_dollar_risk = position_size * stop_distance
 
         if projected_dollar_risk > MAX_RISK_USD:
+            veto_msg = (
+                f"Risk veto for {symbol}: projected dollar risk "
+                f"${projected_dollar_risk:.4f} exceeds max ${MAX_RISK_USD:.2f} "
+                f"(1.5x ATR = {stop_distance:.4f})."
+            )
+            log_action(
+                action="RISK_BLOCK",
+                symbol=symbol,
+                qty=position_size,
+                notional=round(position_size * current_price, 4),
+                price_or_value=current_price,
+                strategy="RISK_MANAGER",
+                reason=veto_msg,
+            )
             return {
                 **state,
                 "risk_cleared": False,
-                "error_message": (
-                    f"Risk veto for {symbol}: projected dollar risk "
-                    f"${projected_dollar_risk:.4f} exceeds max ${MAX_RISK_USD:.2f} "
-                    f"(1.5x ATR = {stop_distance:.4f})."
-                ),
+                "error_message": veto_msg,
             }
 
         stop_loss_price = current_price - stop_distance

@@ -7,9 +7,11 @@ import json
 import os
 import threading
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from dotenv import load_dotenv
 import duckdb
+
+from action_ledger import export_actions_csv
 
 load_dotenv()
 
@@ -217,13 +219,26 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_csv(self, status_code: int, csv_text: str, filename: str = "alpaca_actions.csv") -> None:
+        body = csv_text.encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         normalized_path = parsed.path.rstrip("/")
-        if normalized_path not in ("", "/api/telemetry", "/telemetry"):
+        is_csv_export = normalized_path == "/api/export/actions.csv"
+        if not is_csv_export and normalized_path not in ("", "/api/telemetry", "/telemetry"):
             self._send_json(404, {"data": [], "error": f"Not found: {parsed.path}"})
             return
 
+        query_params = parse_qs(parsed.query)
         expected_key = os.environ.get("TELEMETRY_API_KEY", "").strip()
         is_direct_loopback = (
             self.client_address[0] in ("127.0.0.1", "::1")
@@ -231,13 +246,35 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             and not self.headers.get("X-Forwarded-For")
         )
         if expected_key and not is_direct_loopback:
-            provided_key = self.headers.get("X-API-Key", "").strip()
+            provided_key = (
+                self.headers.get("X-API-Key", "").strip()
+                or (query_params.get("api_key") or [""])[0].strip()
+            )
             if provided_key != expected_key:
                 self._send_json(
                     401,
                     {"data": [], "error": "Unauthorized: invalid or missing X-API-Key"},
                 )
                 return
+
+        if is_csv_export:
+            try:
+                raw_limit = (query_params.get("limit") or ["1000"])[0]
+                limit_val = int(raw_limit)
+            except ValueError:
+                limit_val = 1000
+            raw_actions = (query_params.get("actions") or [""])[0]
+            action_list = [a.strip() for a in raw_actions.split(",") if a.strip()] or None
+            try:
+                csv_text = export_actions_csv(
+                    db_path=self.db_path,
+                    limit=limit_val,
+                    actions=action_list,
+                )
+                self._send_csv(200, csv_text, filename="alpaca_actions.csv")
+            except Exception as exc:
+                self._send_json(500, {"data": [], "error": f"CSV export failed: {exc}"})
+            return
 
         try:
             payload = query_telemetry_payload(db_path=self.db_path)

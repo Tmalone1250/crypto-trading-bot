@@ -23,6 +23,7 @@ import duckdb
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from action_ledger import log_action
 from config import get_alpaca_crypto_data_client, get_alpaca_paper_config
 from state import AgentState
 
@@ -218,6 +219,13 @@ def cancel_open_sell_orders_for_symbol(
         seen_ids.add(oid)
         cancel_order_by_id(oid, mcp_client=mcp_client)
         cancelled_ids.append(oid)
+        log_action(
+            action="CANCEL_ORDER",
+            symbol=symbol,
+            asset_id=oid,
+            strategy="ORDER_SYNC",
+            reason="Cancelled resting sell order to unlock crypto balance.",
+        )
         print(f"[Executor] Cancelled resting sell order {oid} for {symbol} to unlock balance.")
 
     return cancelled_ids
@@ -291,6 +299,16 @@ def sync_resting_take_profit_orders(
                 place_crypto_order(tp_details, mcp_client=mcp_client)
                 if mcp_client is not None
                 else place_crypto_order(tp_details)
+            )
+            log_action(
+                action="TP_SYNC",
+                symbol=symbol,
+                asset_id=trade_id,
+                qty=round(held_qty, 6),
+                notional=round(held_qty * tp_price, 4),
+                price_or_value=tp_price,
+                strategy="GRID_TP_SYNC",
+                reason=f"Synced resting +1.5% GTC TP LIMIT_SELL (cancelled={cancelled})",
             )
             print(
                 f"[Executor] Synced resting +1.5% GTC TP LIMIT_SELL for {symbol}: "
@@ -494,6 +512,13 @@ def execution_node(state: AgentState) -> AgentState:
                 if mcp_client is not None
                 else cancel_all_orders()
             )
+            log_action(
+                action="CIRCUIT_BREAKER",
+                symbol=symbol,
+                asset_id=str(cancel_output),
+                strategy="MACRO_CIRCUIT_BREAKER",
+                reason=str(state.get("rationale") or "Trading SUSPENDED; cancelled all resting orders."),
+            )
             return {
                 **state,
                 "market_regime": "SUSPENDED",
@@ -546,6 +571,7 @@ def execution_node(state: AgentState) -> AgentState:
                     timestamp=timestamp,
                 )
 
+                rough_profit: float | None = None
                 if intent_act in {"LIMIT_SELL", "MARKET_SELL"}:
                     rough_profit = _calculate_sell_profit(
                         state=state,
@@ -554,6 +580,24 @@ def execution_node(state: AgentState) -> AgentState:
                         symbol=intent_sym,
                     )
                     realized_pnl = round(realized_pnl + rough_profit, 6)
+
+                intent_price = float(intent_details.get("target_price", 0.0))
+                intent_rationale = (
+                    intent.get("rationale", "")
+                    if isinstance(intent, dict)
+                    else getattr(intent, "rationale", "")
+                )
+                log_action(
+                    action=intent_act,
+                    symbol=intent_sym,
+                    asset_id=trade_id,
+                    qty=intent_qty,
+                    notional=round(intent_qty * intent_price, 4),
+                    price_or_value=intent_price,
+                    pnl_amount=rough_profit,
+                    strategy=str(state.get("market_regime", "SCALPER")),
+                    reason=str(intent_rationale or state.get("rationale", "")),
+                )
 
                 executed_intents.append(
                     {
@@ -578,6 +622,13 @@ def execution_node(state: AgentState) -> AgentState:
                 cancel_all_orders(mcp_client=mcp_client)
                 if mcp_client is not None
                 else cancel_all_orders()
+            )
+            log_action(
+                action="CANCEL_ALL",
+                symbol=symbol,
+                asset_id=str(cancel_id),
+                strategy=str(state.get("market_regime", "ALPHA")),
+                reason=str(state.get("rationale") or "Cancelled all active orders."),
             )
             updated_order_details = {
                 **order_details,
